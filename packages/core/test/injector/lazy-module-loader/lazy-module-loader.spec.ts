@@ -277,10 +277,7 @@ describe('LazyModuleLoader', () => {
         const moduleRef = await lazyModuleLoader.load(() => definition);
 
         // Assert
-        expect(moduleRef.get(ParentService).items).toEqual([
-          'itemA',
-          'itemB',
-        ]);
+        expect(moduleRef.get(ParentService).items).toEqual(['itemA', 'itemB']);
       });
 
       it('should keep the module resolvable on repeated load() calls', async () => {
@@ -298,10 +295,7 @@ describe('LazyModuleLoader', () => {
 
         // Assert
         expect(first).toBe(second);
-        expect(second.get(ParentService).items).toEqual([
-          'itemA',
-          'itemB',
-        ]);
+        expect(second.get(ParentService).items).toEqual(['itemA', 'itemB']);
       });
 
       it('should bind global providers into a rescanned dynamic import', async () => {
@@ -319,6 +313,430 @@ describe('LazyModuleLoader', () => {
           'child(globalDep)',
         );
       });
+    });
+  });
+
+  describe('lifecycle hooks', () => {
+    it('should run onModuleInit and onApplicationBootstrap, imported modules first and same-parent imports in order', async () => {
+      const calls: string[] = [];
+
+      @Injectable()
+      class ServiceB1 {
+        onModuleInit() {
+          calls.push('B1.provider.init');
+        }
+        onApplicationBootstrap() {
+          calls.push('B1.provider.bootstrap');
+        }
+      }
+      @Module({ providers: [ServiceB1] })
+      class ModuleB1 {
+        onModuleInit() {
+          calls.push('B1.module.init');
+        }
+        onApplicationBootstrap() {
+          calls.push('B1.module.bootstrap');
+        }
+      }
+
+      @Injectable()
+      class ServiceB2 {
+        onModuleInit() {
+          calls.push('B2.provider.init');
+        }
+        onApplicationBootstrap() {
+          calls.push('B2.provider.bootstrap');
+        }
+      }
+      @Module({ providers: [ServiceB2] })
+      class ModuleB2 {
+        onModuleInit() {
+          calls.push('B2.module.init');
+        }
+        onApplicationBootstrap() {
+          calls.push('B2.module.bootstrap');
+        }
+      }
+
+      @Injectable()
+      class ServiceA {
+        onModuleInit() {
+          calls.push('A.provider.init');
+        }
+        onApplicationBootstrap() {
+          calls.push('A.provider.bootstrap');
+        }
+      }
+      @Module({ imports: [ModuleB1, ModuleB2], providers: [ServiceA] })
+      class ModuleA {
+        onModuleInit() {
+          calls.push('A.module.init');
+        }
+        onApplicationBootstrap() {
+          calls.push('A.module.bootstrap');
+        }
+      }
+
+      await lazyModuleLoader.load(() => ModuleA);
+
+      expect(calls).toEqual([
+        'B1.provider.init',
+        'B1.module.init',
+        'B2.provider.init',
+        'B2.module.init',
+        'A.provider.init',
+        'A.module.init',
+        'B1.provider.bootstrap',
+        'B1.module.bootstrap',
+        'B2.provider.bootstrap',
+        'B2.module.bootstrap',
+        'A.provider.bootstrap',
+        'A.module.bootstrap',
+      ]);
+    });
+
+    it('should not re-run hooks on repeated load and should return the same module reference', async () => {
+      let initCount = 0;
+      let bootstrapCount = 0;
+
+      @Injectable()
+      class HookedService {
+        onModuleInit() {
+          initCount++;
+        }
+        onApplicationBootstrap() {
+          bootstrapCount++;
+        }
+      }
+      @Module({ providers: [HookedService] })
+      class HookedModule {}
+
+      const moduleRef = await lazyModuleLoader.load(() => HookedModule);
+      const moduleRef2 = await lazyModuleLoader.load(() => HookedModule);
+
+      expect(moduleRef).toBe(moduleRef2);
+      expect(initCount).toBe(1);
+      expect(bootstrapCount).toBe(1);
+    });
+
+    it('should initialize the module only once for concurrent load calls', async () => {
+      let constructionsCount = 0;
+      let initCount = 0;
+
+      @Injectable()
+      class HookedService {
+        constructor() {
+          constructionsCount++;
+        }
+        onModuleInit() {
+          initCount++;
+        }
+      }
+      @Module({ providers: [HookedService] })
+      class HookedModule {}
+
+      const [moduleRef, moduleRef2] = await Promise.all([
+        lazyModuleLoader.load(() => HookedModule),
+        lazyModuleLoader.load(() => HookedModule),
+      ]);
+
+      expect(moduleRef).toBe(moduleRef2);
+      expect(constructionsCount).toBe(1);
+      expect(initCount).toBe(1);
+    });
+
+    it('should use the module class as identity, ignoring dynamic metadata', async () => {
+      let constructionsCount = 0;
+      let initCount = 0;
+
+      @Injectable()
+      class HookedService {
+        constructor() {
+          constructionsCount++;
+        }
+        onModuleInit() {
+          initCount++;
+        }
+      }
+      @Module({})
+      class DynamicIdentityModule {}
+
+      const moduleRef = await lazyModuleLoader.load((): DynamicModule => ({
+        module: DynamicIdentityModule,
+        providers: [HookedService],
+      }));
+      const moduleRef2 = await lazyModuleLoader.load((): DynamicModule => ({
+        module: DynamicIdentityModule,
+        providers: [{ provide: 'IGNORED', useValue: 'ignored' }],
+      }));
+
+      expect(moduleRef).toBe(moduleRef2);
+      expect(moduleRef.get(HookedService)).toBeInstanceOf(HookedService);
+      expect(constructionsCount).toBe(1);
+      expect(initCount).toBe(1);
+    });
+
+    it('should not run hooks for modules that were already instantiated', async () => {
+      let sharedInitCount = 0;
+      let lazyInitCount = 0;
+
+      @Injectable()
+      class SharedService {
+        onModuleInit() {
+          sharedInitCount++;
+        }
+      }
+      @Module({ providers: [SharedService], exports: [SharedService] })
+      class AlreadyLoadedModule {}
+
+      @Injectable()
+      class LazyService {
+        onModuleInit() {
+          lazyInitCount++;
+        }
+      }
+      @Module({ imports: [AlreadyLoadedModule], providers: [LazyService] })
+      class LazyRootModule {}
+
+      // Boot the shared module eagerly (as the application would)
+      await dependenciesScanner.scan(AlreadyLoadedModule);
+      await instanceLoader.createInstancesOfDependencies();
+
+      await lazyModuleLoader.load(() => LazyRootModule);
+
+      expect(sharedInitCount).toBe(0);
+      expect(lazyInitCount).toBe(1);
+    });
+
+    describe('when a startup hook fails', () => {
+      it('should reject with the original error and only complete pending instances on retry', async () => {
+        const calls: string[] = [];
+        const failure = new Error('onModuleInit failed');
+        let shouldFail = true;
+
+        @Injectable()
+        class ServiceB {
+          onModuleInit() {
+            calls.push('B.init');
+          }
+          onApplicationBootstrap() {
+            calls.push('B.bootstrap');
+          }
+        }
+        @Module({ providers: [ServiceB] })
+        class ModuleB {}
+
+        @Injectable()
+        class ServiceA {
+          onModuleInit() {
+            if (shouldFail) {
+              throw failure;
+            }
+            calls.push('A.init');
+          }
+          onApplicationBootstrap() {
+            calls.push('A.bootstrap');
+          }
+        }
+        @Module({ imports: [ModuleB], providers: [ServiceA] })
+        class ModuleA {}
+
+        await expect(lazyModuleLoader.load(() => ModuleA)).rejects.toBe(
+          failure,
+        );
+        expect(calls).toEqual(['B.init']);
+
+        shouldFail = false;
+        const moduleRef = await lazyModuleLoader.load(() => ModuleA);
+
+        expect(moduleRef).toBeInstanceOf(ModuleRef);
+        expect(calls).toEqual([
+          'B.init',
+          'A.init',
+          'B.bootstrap',
+          'A.bootstrap',
+        ]);
+      });
+
+      it('should not re-run completed phases when a later phase fails', async () => {
+        const calls: string[] = [];
+        const failure = new Error('onApplicationBootstrap failed');
+        let shouldFail = true;
+
+        @Injectable()
+        class HookedService {
+          onModuleInit() {
+            calls.push('init');
+          }
+          onApplicationBootstrap() {
+            if (shouldFail) {
+              throw failure;
+            }
+            calls.push('bootstrap');
+          }
+        }
+        @Module({ providers: [HookedService] })
+        class HookedModule {}
+
+        await expect(lazyModuleLoader.load(() => HookedModule)).rejects.toBe(
+          failure,
+        );
+        expect(calls).toEqual(['init']);
+
+        shouldFail = false;
+        await lazyModuleLoader.load(() => HookedModule);
+        expect(calls).toEqual(['init', 'bootstrap']);
+      });
+    });
+  });
+
+  describe('close', () => {
+    it('should run shutdown hooks in reverse startup order, once per instance', async () => {
+      const calls: string[] = [];
+
+      @Injectable()
+      class ServiceB {
+        onModuleDestroy() {
+          calls.push('B.destroy');
+        }
+        beforeApplicationShutdown() {
+          calls.push('B.beforeShutdown');
+        }
+        onApplicationShutdown() {
+          calls.push('B.shutdown');
+        }
+      }
+      @Module({ providers: [ServiceB] })
+      class ModuleB {}
+
+      @Injectable()
+      class ServiceA {
+        onModuleDestroy() {
+          calls.push('A.destroy');
+        }
+        beforeApplicationShutdown() {
+          calls.push('A.beforeShutdown');
+        }
+        onApplicationShutdown() {
+          calls.push('A.shutdown');
+        }
+      }
+      @Module({ imports: [ModuleB], providers: [ServiceA] })
+      class ModuleA {}
+
+      await lazyModuleLoader.load(() => ModuleA);
+      await lazyModuleLoader.close();
+
+      expect(calls).toEqual([
+        'A.destroy',
+        'B.destroy',
+        'A.beforeShutdown',
+        'B.beforeShutdown',
+        'A.shutdown',
+        'B.shutdown',
+      ]);
+    });
+
+    it('should destroy modules from separate loads in reverse load order', async () => {
+      const calls: string[] = [];
+
+      @Injectable()
+      class Service1 {
+        onModuleDestroy() {
+          calls.push('1.destroy');
+        }
+      }
+      @Module({ providers: [Service1] })
+      class Module1 {}
+
+      @Injectable()
+      class Service2 {
+        onModuleDestroy() {
+          calls.push('2.destroy');
+        }
+      }
+      @Module({ providers: [Service2] })
+      class Module2 {}
+
+      await lazyModuleLoader.load(() => Module1);
+      await lazyModuleLoader.load(() => Module2);
+      await lazyModuleLoader.close();
+
+      expect(calls).toEqual(['2.destroy', '1.destroy']);
+    });
+
+    it('should not destroy instances again on concurrent or repeated close calls', async () => {
+      let destroyCount = 0;
+
+      @Injectable()
+      class HookedService {
+        onModuleDestroy() {
+          destroyCount++;
+        }
+      }
+      @Module({ providers: [HookedService] })
+      class HookedModule {}
+
+      await lazyModuleLoader.load(() => HookedModule);
+      await Promise.all([lazyModuleLoader.close(), lazyModuleLoader.close()]);
+      await lazyModuleLoader.close();
+
+      expect(destroyCount).toBe(1);
+    });
+
+    it('should reject load calls after close without creating instances', async () => {
+      let constructionsCount = 0;
+      let loaderCalled = false;
+
+      @Injectable()
+      class SomeService {
+        constructor() {
+          constructionsCount++;
+        }
+      }
+      @Module({ providers: [SomeService] })
+      class SomeModule {}
+
+      await lazyModuleLoader.close();
+
+      await expect(
+        lazyModuleLoader.load(() => {
+          loaderCalled = true;
+          return SomeModule;
+        }),
+      ).rejects.toThrow('Application is closed');
+      expect(loaderCalled).toBe(false);
+      expect(constructionsCount).toBe(0);
+    });
+
+    it('should resolve close even when shutdown hooks throw', async () => {
+      const calls: string[] = [];
+
+      @Injectable()
+      class FailingService {
+        onModuleDestroy() {
+          throw new Error('destroy failed');
+        }
+        beforeApplicationShutdown() {
+          throw new Error('beforeApplicationShutdown failed');
+        }
+      }
+      @Injectable()
+      class OtherService {
+        onModuleDestroy() {
+          calls.push('other.destroy');
+        }
+        onApplicationShutdown() {
+          calls.push('other.shutdown');
+        }
+      }
+      @Module({ providers: [FailingService, OtherService] })
+      class SomeModule {}
+
+      await lazyModuleLoader.load(() => SomeModule);
+
+      await expect(lazyModuleLoader.close()).resolves.toBeUndefined();
+      expect(calls).toEqual(['other.destroy', 'other.shutdown']);
     });
   });
 });
