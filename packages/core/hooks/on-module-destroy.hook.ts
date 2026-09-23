@@ -20,13 +20,19 @@ function hasOnModuleDestroyHook(
 /**
  * Calls the given instances onModuleDestroy hook
  */
-function callOperator(instances: unknown[]): Promise<any>[] {
+function callOperator(
+  instances: unknown[],
+  calledInstances?: WeakSet<object>,
+): Promise<any>[] {
   return iterate(instances)
     .filter(instance => !isNil(instance))
     .filter(hasOnModuleDestroyHook)
-    .map(async instance =>
-      (instance as any as OnModuleDestroy).onModuleDestroy(),
-    )
+    .filter(instance => !calledInstances?.has(instance as object))
+    .map(async instance => {
+      // Destroy hooks run at most once per instance, even when they fail.
+      calledInstances?.add(instance as object);
+      return (instance as any as OnModuleDestroy).onModuleDestroy();
+    })
     .toArray();
 }
 
@@ -35,8 +41,14 @@ function callOperator(instances: unknown[]): Promise<any>[] {
  * (providers / controllers).
  *
  * @param moduleRef The module which will be initialized
+ * @param calledInstances Optional set of instances whose hook has already
+ * been triggered. Instances in the set are skipped; every triggered
+ * instance is added to the set exactly once.
  */
-export async function callModuleDestroyHook(moduleRef: Module): Promise<any> {
+export async function callModuleDestroyHook(
+  moduleRef: Module,
+  calledInstances?: WeakSet<object>,
+): Promise<any> {
   const providers = moduleRef.getNonAliasProviders();
   // Module (class) instance is the first element of the providers array
   // Lifecycle hook has to be called once all classes are properly destroyed
@@ -51,7 +63,7 @@ export async function callModuleDestroyHook(moduleRef: Module): Promise<any> {
   const levels = getSortedHierarchyLevels(groupedInstances, 'DESC');
   for (const level of levels) {
     const results = await Promise.allSettled(
-      callOperator(groupedInstances.get(level)!),
+      callOperator(groupedInstances.get(level)!, calledInstances),
     );
     results
       .filter(
@@ -68,8 +80,10 @@ export async function callModuleDestroyHook(moduleRef: Module): Promise<any> {
   if (
     moduleClassInstance &&
     hasOnModuleDestroyHook(moduleClassInstance) &&
-    moduleClassHost.isDependencyTreeStatic()
+    moduleClassHost.isDependencyTreeStatic() &&
+    !calledInstances?.has(moduleClassInstance)
   ) {
+    calledInstances?.add(moduleClassInstance);
     try {
       await moduleClassInstance.onModuleDestroy();
     } catch (err) {

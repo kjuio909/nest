@@ -21,13 +21,24 @@ function hasOnAppBootstrapHook(
 /**
  * Calls the given instances
  */
-function callOperator(instances: unknown[]): Promise<any>[] {
+function callOperator(
+  instances: unknown[],
+  calledInstances?: WeakSet<object>,
+): Promise<any>[] {
   return iterate(instances)
     .filter(instance => !isNil(instance))
     .filter(hasOnAppBootstrapHook)
-    .map(async instance =>
-      (instance as any as OnApplicationBootstrap).onApplicationBootstrap(),
-    )
+    .filter(instance => !calledInstances?.has(instance as object))
+    .map(async instance => {
+      calledInstances?.add(instance as object);
+      try {
+        await (instance as any as OnApplicationBootstrap).onApplicationBootstrap();
+      } catch (err) {
+        // Unmark the instance so a retry can complete the hook for it.
+        calledInstances?.delete(instance as object);
+        throw err;
+      }
+    })
     .toArray();
 }
 
@@ -36,8 +47,15 @@ function callOperator(instances: unknown[]): Promise<any>[] {
  * (providers / controllers).
  *
  * @param moduleRef The module which will be initialized
+ * @param calledInstances Optional set of instances whose hook has already
+ * been triggered. Instances in the set are skipped; instances are added to
+ * the set as soon as their hook starts running and removed again if the
+ * hook fails, so a retry only completes what is missing.
  */
-export async function callModuleBootstrapHook(moduleRef: Module): Promise<any> {
+export async function callModuleBootstrapHook(
+  moduleRef: Module,
+  calledInstances?: WeakSet<object>,
+): Promise<any> {
   const providers = moduleRef.getNonAliasProviders();
   // Module (class) instance is the first element of the providers array
   // Lifecycle hook has to be called once all classes are properly initialized
@@ -51,7 +69,7 @@ export async function callModuleBootstrapHook(moduleRef: Module): Promise<any> {
 
   const levels = getSortedHierarchyLevels(groupedInstances);
   for (const level of levels) {
-    await Promise.all(callOperator(groupedInstances.get(level)!));
+    await Promise.all(callOperator(groupedInstances.get(level)!, calledInstances));
   }
 
   // Call the instance itself
@@ -59,8 +77,15 @@ export async function callModuleBootstrapHook(moduleRef: Module): Promise<any> {
   if (
     moduleClassInstance &&
     hasOnAppBootstrapHook(moduleClassInstance) &&
-    moduleClassHost.isDependencyTreeStatic()
+    moduleClassHost.isDependencyTreeStatic() &&
+    !calledInstances?.has(moduleClassInstance)
   ) {
-    await moduleClassInstance.onApplicationBootstrap();
+    calledInstances?.add(moduleClassInstance);
+    try {
+      await moduleClassInstance.onApplicationBootstrap();
+    } catch (err) {
+      calledInstances?.delete(moduleClassInstance);
+      throw err;
+    }
   }
 }

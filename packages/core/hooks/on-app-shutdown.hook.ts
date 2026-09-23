@@ -20,13 +20,22 @@ function hasOnAppShutdownHook(
 /**
  * Calls the given instances
  */
-function callOperator(instances: unknown[], signal?: string): Promise<any>[] {
+function callOperator(
+  instances: unknown[],
+  signal?: string,
+  calledInstances?: WeakSet<object>,
+): Promise<any>[] {
   return iterate(instances)
     .filter(instance => !isNil(instance))
     .filter(hasOnAppShutdownHook)
-    .map(async instance =>
-      (instance as any as OnApplicationShutdown).onApplicationShutdown(signal),
-    )
+    .filter(instance => !calledInstances?.has(instance as object))
+    .map(async instance => {
+      // Shutdown hooks run at most once per instance, even when they fail.
+      calledInstances?.add(instance as object);
+      return (instance as any as OnApplicationShutdown).onApplicationShutdown(
+        signal,
+      );
+    })
     .toArray();
 }
 
@@ -36,10 +45,14 @@ function callOperator(instances: unknown[], signal?: string): Promise<any>[] {
  *
  * @param moduleRef The module which will be initialized
  * @param signal
+ * @param calledInstances Optional set of instances whose hook has already
+ * been triggered. Instances in the set are skipped; every triggered
+ * instance is added to the set exactly once.
  */
 export async function callAppShutdownHook(
   moduleRef: Module,
   signal?: string,
+  calledInstances?: WeakSet<object>,
 ): Promise<any> {
   const providers = moduleRef.getNonAliasProviders();
   // Module (class) instance is the first element of the providers array
@@ -55,7 +68,7 @@ export async function callAppShutdownHook(
   const levels = getSortedHierarchyLevels(groupedInstances, 'DESC');
   for (const level of levels) {
     const results = await Promise.allSettled(
-      callOperator(groupedInstances.get(level)!, signal),
+      callOperator(groupedInstances.get(level)!, signal, calledInstances),
     );
     results
       .filter(
@@ -71,8 +84,10 @@ export async function callAppShutdownHook(
   if (
     moduleClassInstance &&
     hasOnAppShutdownHook(moduleClassInstance) &&
-    moduleClassHost.isDependencyTreeStatic()
+    moduleClassHost.isDependencyTreeStatic() &&
+    !calledInstances?.has(moduleClassInstance)
   ) {
+    calledInstances?.add(moduleClassInstance);
     try {
       await moduleClassInstance.onApplicationShutdown(signal);
     } catch (err) {

@@ -21,6 +21,7 @@ import { NestContainer } from './injector/container.js';
 import { Injector } from './injector/injector.js';
 import { InstanceLinksHost } from './injector/instance-links-host.js';
 import { ContextId } from './injector/instance-wrapper.js';
+import { LazyModuleLoader } from './injector/lazy-module-loader/lazy-module-loader.js';
 import { Module } from './injector/module.js';
 import type { Abstract, DynamicModule, Type } from '@nestjs/common';
 import {
@@ -56,6 +57,7 @@ export class NestApplicationContext<
   private shutdownPromise?: Promise<void>;
   private _instanceLinksHost: InstanceLinksHost;
   private _moduleRefsForHooksByDistance?: Array<Module>;
+  private _lazyModuleLoader: LazyModuleLoader | null | undefined;
   private initializationPromise?: Promise<void>;
 
   protected get instanceLinksHost() {
@@ -439,6 +441,10 @@ export class NestApplicationContext<
    * modules and its children.
    */
   protected async callDestroyHook(): Promise<void> {
+    // Lazily loaded modules started after the eager graph, so they are
+    // torn down first, in reverse startup order.
+    await this.lazyModuleLoader?.callOnModuleDestroyHooks();
+
     const modulesSortedByDistance = [
       ...this.getModulesToTriggerHooksOn(),
     ].reverse();
@@ -457,6 +463,10 @@ export class NestApplicationContext<
     for (const module of modulesSortedByDistance) {
       await callModuleBootstrapHook(module);
     }
+    // From now on, modules loaded through the `LazyModuleLoader` have to
+    // run their lifecycle hooks as part of `load()` itself. Modules swept
+    // by this init cycle keep being managed by the application context.
+    await this.markLazyModulesAsInitialized();
   }
 
   /**
@@ -464,6 +474,8 @@ export class NestApplicationContext<
    * modules and children.
    */
   protected async callShutdownHook(signal?: string): Promise<void> {
+    await this.lazyModuleLoader?.callOnApplicationShutdownHooks(signal);
+
     const modulesSortedByDistance = [
       ...this.getModulesToTriggerHooksOn(),
     ].reverse();
@@ -478,6 +490,8 @@ export class NestApplicationContext<
    * modules and children.
    */
   protected async callBeforeShutdownHook(signal?: string): Promise<void> {
+    await this.lazyModuleLoader?.callBeforeApplicationShutdownHooks(signal);
+
     const modulesSortedByDistance = [
       ...this.getModulesToTriggerHooksOn(),
     ].reverse();
@@ -493,6 +507,31 @@ export class NestApplicationContext<
       this.logger.error(error);
       throw new Error(error);
     }
+  }
+
+  /**
+   * The `LazyModuleLoader` instance registered by the internal core module,
+   * or `null` when it has not been instantiated (e.g. in preview mode).
+   */
+  protected get lazyModuleLoader(): LazyModuleLoader | null {
+    if (typeof this._lazyModuleLoader === 'undefined') {
+      this._lazyModuleLoader =
+        this.container
+          .getInternalCoreModuleRef?.()
+          ?.getProviderByKey(LazyModuleLoader)?.instance ?? null;
+    }
+    return this._lazyModuleLoader;
+  }
+
+  /**
+   * Hands the modules swept during this init cycle over to the application
+   * lifecycle and notifies the lazy module loader that, from now on, it has
+   * to run the lifecycle hooks of newly loaded modules itself.
+   */
+  private async markLazyModulesAsInitialized(): Promise<void> {
+    await this.lazyModuleLoader?.markApplicationInitialized(
+      this.getModulesToTriggerHooksOn(),
+    );
   }
 
   private getModulesToTriggerHooksOn(): Module[] {
