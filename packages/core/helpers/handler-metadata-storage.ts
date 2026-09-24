@@ -34,6 +34,7 @@ export interface HandlerMetadata {
   httpStatusCode: number;
   responseHeaders: any[];
   hasCustomHeaders: boolean;
+  aggregateParamErrors: boolean;
   getParamsMetadata: (
     moduleKey: string,
     contextId?: ContextId,

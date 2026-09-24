@@ -5,8 +5,13 @@ import { PassThrough } from 'stream';
 import { CUSTOM_ROUTE_ARGS_METADATA } from '../../../common/constants.js';
 import { RouteParamtypes } from '../../../common/enums/route-paramtypes.enum.js';
 import {
+  AggregateParamErrors,
+  BadRequestException,
   HttpException,
   HttpStatus,
+  NotFoundException,
+  Param,
+  Query,
   RouteParamMetadata,
 } from '../../../common/index.js';
 import { AbstractHttpAdapter } from '../../adapters/index.js';
@@ -333,7 +338,323 @@ describe('RouterExecutionContext', () => {
         expect(pipesFn).toBeNull();
       });
     });
+
+    const buildParamsOptions = () => [
+      {
+        index: 0,
+        type: RouteParamtypes.PARAM,
+        data: 'id',
+        pipes: [],
+        extractValue: () => 'abc',
+      },
+      {
+        index: 1,
+        type: RouteParamtypes.QUERY,
+        data: 'limit',
+        pipes: [],
+        extractValue: () => 'x',
+      },
+    ];
+
+    describe('when "aggregateParamErrors" is not enabled', () => {
+      it('keeps the fail-fast behavior and rejects with the first exception', async () => {
+        const paramsOptions = buildParamsOptions();
+        vi.spyOn(contextCreator, 'getParamValue').mockImplementation(
+          async (_value, metadata) => {
+            if (metadata.data === 'id') {
+              throw new BadRequestException('A');
+            }
+            throw new BadRequestException('B');
+          },
+        );
+
+        const pipesFn = contextCreator.createPipesFn([], paramsOptions)!;
+        let error: BadRequestException;
+        try {
+          await pipesFn([], {}, {}, () => {});
+        } catch (e) {
+          error = e as BadRequestException;
+        }
+
+        expect(error!).toBeInstanceOf(BadRequestException);
+        expect(error!.getResponse()).toEqual({
+          statusCode: 400,
+          error: 'Bad Request',
+          message: 'A',
+        });
+      });
+    });
+
+    describe('when "aggregateParamErrors" is enabled', () => {
+      it('aggregates multiple BadRequestExceptions sorted by parameter position', async () => {
+        // Metadata insertion order is reversed w.r.t. parameter position.
+        const paramsOptions = [...buildParamsOptions()].reverse();
+        vi.spyOn(contextCreator, 'getParamValue').mockImplementation(
+          async (_value, metadata) => {
+            throw new BadRequestException(metadata.data === 'id' ? 'A' : 'B');
+          },
+        );
+
+        const pipesFn = contextCreator.createPipesFn([], paramsOptions, true)!;
+        let error: BadRequestException;
+        try {
+          await pipesFn([], {}, {}, () => {});
+        } catch (e) {
+          error = e as BadRequestException;
+        }
+
+        expect(error!).toBeInstanceOf(BadRequestException);
+        expect(error!.getStatus()).toBe(HttpStatus.BAD_REQUEST);
+        expect(error!.getResponse()).toEqual({
+          statusCode: 400,
+          error: 'Bad Request',
+          message: ['A', 'B'],
+        });
+      });
+
+      it('keeps the same response shape for a single error', async () => {
+        const paramsOptions = buildParamsOptions();
+        vi.spyOn(contextCreator, 'getParamValue').mockImplementation(
+          async (_value, metadata) => {
+            if (metadata.data === 'id') {
+              throw new BadRequestException('A');
+            }
+            return 10;
+          },
+        );
+        const args: any[] = [];
+
+        const pipesFn = contextCreator.createPipesFn([], paramsOptions, true)!;
+        let error: BadRequestException;
+        try {
+          await pipesFn(args, {}, {}, () => {});
+        } catch (e) {
+          error = e as BadRequestException;
+        }
+
+        expect(error!).toBeInstanceOf(BadRequestException);
+        expect(error!.getResponse()).toEqual({
+          statusCode: 400,
+          error: 'Bad Request',
+          message: ['A'],
+        });
+      });
+
+      it('runs every @Param/@Query pipe serially even after an earlier one failed', async () => {
+        const paramsOptions = buildParamsOptions();
+        const callOrder: string[] = [];
+        vi.spyOn(contextCreator, 'getParamValue').mockImplementation(
+          async (_value, metadata) => {
+            callOrder.push(metadata.data as string);
+            throw new BadRequestException(metadata.data as string);
+          },
+        );
+
+        const pipesFn = contextCreator.createPipesFn([], paramsOptions, true)!;
+        try {
+          await pipesFn([], {}, {}, () => {});
+        } catch {}
+
+        expect(callOrder).toEqual(['id', 'limit']);
+      });
+
+      it('resolves all arguments and does not throw when every pipe succeeds', async () => {
+        const paramsOptions = buildParamsOptions();
+        vi.spyOn(contextCreator, 'getParamValue').mockResolvedValue(7);
+        const args: any[] = [];
+
+        const pipesFn = contextCreator.createPipesFn([], paramsOptions, true)!;
+        await pipesFn(args, {}, {}, () => {});
+
+        expect(args).toEqual([7, 7]);
+      });
+
+      it('flattens array messages carried by individual BadRequestExceptions', async () => {
+        const paramsOptions = buildParamsOptions();
+        vi.spyOn(contextCreator, 'getParamValue').mockImplementation(
+          async (_value, metadata) => {
+            throw new BadRequestException(
+              metadata.data === 'id' ? ['A1', 'A2'] : ['B'],
+            );
+          },
+        );
+
+        const pipesFn = contextCreator.createPipesFn([], paramsOptions, true)!;
+        let error: BadRequestException;
+        try {
+          await pipesFn([], {}, {}, () => {});
+        } catch (e) {
+          error = e as BadRequestException;
+        }
+
+        expect(error!.getResponse()).toEqual(
+          expect.objectContaining({
+            message: ['A1', 'A2', 'B'],
+          }),
+        );
+      });
+
+      it('propagates non-BadRequest errors through the existing path', async () => {
+        const paramsOptions = buildParamsOptions();
+        const notFound = new NotFoundException();
+        vi.spyOn(contextCreator, 'getParamValue').mockImplementation(
+          async (_value, metadata) => {
+            if (metadata.data === 'id') {
+              throw notFound;
+            }
+            throw new BadRequestException('B');
+          },
+        );
+
+        const pipesFn = contextCreator.createPipesFn([], paramsOptions, true)!;
+        let error: unknown;
+        try {
+          await pipesFn([], {}, {}, () => {});
+        } catch (e) {
+          error = e;
+        }
+
+        expect(error).toBe(notFound);
+      });
+
+      it('does not aggregate @Body() pipe errors', async () => {
+        const paramsOptions = [
+          ...buildParamsOptions(),
+          {
+            index: 2,
+            type: RouteParamtypes.BODY,
+            data: undefined,
+            pipes: [],
+            extractValue: () => ({}),
+          },
+        ];
+        const bodyError = new BadRequestException('body');
+        vi.spyOn(contextCreator, 'getParamValue').mockImplementation(
+          async (_value, metadata) => {
+            if (metadata.type === RouteParamtypes.BODY) {
+              throw bodyError;
+            }
+            throw new BadRequestException(metadata.data === 'id' ? 'A' : 'B');
+          },
+        );
+
+        const pipesFn = contextCreator.createPipesFn([], paramsOptions, true)!;
+        let error: unknown;
+        try {
+          await pipesFn([], {}, {}, () => {});
+        } catch (e) {
+          error = e;
+        }
+
+        expect(error).toBe(bodyError);
+      });
+    });
   });
+
+  describe('isParamErrorAggregatable', () => {
+    it('returns true only for @Param() and @Query() paramtypes', () => {
+      expect(
+        contextCreator.isParamErrorAggregatable(RouteParamtypes.PARAM),
+      ).toBe(true);
+      expect(
+        contextCreator.isParamErrorAggregatable(RouteParamtypes.QUERY),
+      ).toBe(true);
+      expect(
+        contextCreator.isParamErrorAggregatable(RouteParamtypes.BODY),
+      ).toBe(false);
+      expect(
+        contextCreator.isParamErrorAggregatable(RouteParamtypes.REQUEST),
+      ).toBe(false);
+      expect(contextCreator.isParamErrorAggregatable('custom')).toBe(false);
+    });
+  });
+
+  describe('aggregate param errors through the request proxy', () => {
+    const idPipe = {
+      transform: vi.fn(async (value: string) => {
+        if (value === 'abc') {
+          throw new BadRequestException('A');
+        }
+        return Number(value);
+      }),
+    };
+    const limitPipe = {
+      transform: vi.fn(async (value: string) => {
+        if (value === 'x') {
+          throw new BadRequestException('B');
+        }
+        return Number(value);
+      }),
+    };
+
+    class TestController {
+      @AggregateParamErrors()
+      public findOne(
+        @Param('id', idPipe as any)
+        id: number,
+        @Query('limit', limitPipe as any)
+        limit: number,
+      ) {
+        this.handledWith = [id, limit];
+        return [id, limit];
+      }
+
+      public handledWith: unknown;
+    }
+
+    const buildProxy = () => {
+      const instance = new TestController();
+      const proxy = contextCreator.create(
+        instance as any,
+        instance.findOne,
+        'findOne',
+        '',
+        0,
+      );
+      return { instance, proxy };
+    };
+
+    beforeEach(() => {
+      idPipe.transform.mockClear();
+      limitPipe.transform.mockClear();
+    });
+
+    it('skips the handler and throws one aggregated BadRequestException', async () => {
+      const { instance, proxy } = buildProxy();
+
+      let error: BadRequestException;
+      try {
+        await proxy(
+          { params: { id: 'abc' }, query: { limit: 'x' } },
+          {},
+          () => {},
+        );
+      } catch (e) {
+        error = e as BadRequestException;
+      }
+
+      expect(error!).toBeInstanceOf(BadRequestException);
+      expect(error!.getResponse()).toEqual({
+        statusCode: 400,
+        error: 'Bad Request',
+        message: ['A', 'B'],
+      });
+      expect(instance.handledWith).toBeUndefined();
+    });
+
+    it('invokes the handler with the transformed arguments when all pipes pass', async () => {
+      const { instance, proxy } = buildProxy();
+
+      await proxy(
+        { params: { id: '7' }, query: { limit: '10' } },
+        {},
+        () => {},
+      );
+
+      expect(instance.handledWith).toEqual([7, 10]);
+    });
+  });
+
   describe('createGuardsFn', () => {
     it('should throw ForbiddenException when "tryActivate" returns false', async () => {
       const guardsFn = contextCreator.createGuardsFn([null!], null!, null!)!;

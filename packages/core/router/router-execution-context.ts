@@ -5,6 +5,7 @@ import type {
 } from '@nestjs/common';
 import {
   type CanActivate,
+  BadRequestException,
   ForbiddenException,
   type HttpServer,
   type ParamData,
@@ -14,6 +15,7 @@ import {
 } from '@nestjs/common';
 import {
   type Controller,
+  AGGREGATE_PARAM_ERRORS_METADATA,
   CUSTOM_ROUTE_ARGS_METADATA,
   HEADERS_METADATA,
   HTTP_CODE_METADATA,
@@ -104,6 +106,7 @@ export class RouterExecutionContext {
       httpStatusCode,
       responseHeaders,
       hasCustomHeaders,
+      aggregateParamErrors,
     } = this.getMetadata(
       instance,
       callback,
@@ -145,7 +148,11 @@ export class RouterExecutionContext {
       callback,
       contextType,
     );
-    const fnApplyPipes = this.createPipesFn(pipes, paramsOptions);
+    const fnApplyPipes = this.createPipesFn(
+      pipes,
+      paramsOptions,
+      aggregateParamErrors,
+    );
 
     const handler =
       <TRequest, TResponse>(
@@ -257,6 +264,7 @@ export class RouterExecutionContext {
 
     const responseHeaders = this.reflectResponseHeaders(callback);
     const hasCustomHeaders = !isEmptyArray(responseHeaders);
+    const aggregateParamErrors = this.reflectAggregateParamErrors(callback);
     const handlerMetadata: HandlerMetadata = {
       argsLength,
       fnHandleResponse,
@@ -266,6 +274,7 @@ export class RouterExecutionContext {
       httpStatusCode,
       hasCustomHeaders,
       responseHeaders,
+      aggregateParamErrors,
     };
     this.handlerMetadataStorage.set(instance, methodName, handlerMetadata);
     return handlerMetadata;
@@ -297,6 +306,12 @@ export class RouterExecutionContext {
 
   public reflectSse(callback: (...args: unknown[]) => unknown): string {
     return Reflect.getMetadata(SSE_METADATA, callback);
+  }
+
+  public reflectAggregateParamErrors(
+    callback: (...args: unknown[]) => unknown,
+  ): boolean {
+    return Reflect.getMetadata(AGGREGATE_PARAM_ERRORS_METADATA, callback);
   }
 
   public exchangeKeysForValues(
@@ -396,38 +411,118 @@ export class RouterExecutionContext {
   public createPipesFn(
     pipes: PipeTransform[],
     paramsOptions: (ParamProperties & { metatype?: any })[],
+    aggregateParamErrors = false,
   ) {
+    const resolveParamValue = async <TRequest, TResponse>(
+      param: ParamProperties & { metatype?: any },
+      args: any[],
+      req: TRequest,
+      res: TResponse,
+      next: Function,
+    ) => {
+      const {
+        index,
+        extractValue,
+        type,
+        data,
+        metatype,
+        pipes: paramPipes,
+        schema,
+      } = param;
+      const value = extractValue(req, res, next);
+
+      args[index] = this.isPipeable(type)
+        ? await this.getParamValue(
+            value,
+            { metatype, type, data, schema } as ArgumentMetadata,
+            pipes.concat(paramPipes),
+          )
+        : value;
+    };
+
     const pipesFn = async <TRequest, TResponse>(
       args: any[],
       req: TRequest,
       res: TResponse,
       next: Function,
     ) => {
-      const resolveParamValue = async (
-        param: ParamProperties & { metatype?: any },
-      ) => {
-        const {
-          index,
-          extractValue,
-          type,
-          data,
-          metatype,
-          pipes: paramPipes,
-          schema,
-        } = param;
-        const value = extractValue(req, res, next);
+      if (!aggregateParamErrors) {
+        await Promise.all(
+          paramsOptions.map(param =>
+            resolveParamValue(param, args, req, res, next),
+          ),
+        );
+        return;
+      }
 
-        args[index] = this.isPipeable(type)
-          ? await this.getParamValue(
-              value,
-              { metatype, type, data, schema } as ArgumentMetadata,
-              pipes.concat(paramPipes),
-            )
-          : value;
-      };
-      await Promise.all(paramsOptions.map(resolveParamValue));
+      // @Param()/@Query() pipes run serially in parameter-position order and
+      // their BadRequestExceptions are collected into a single exception;
+      // every other parameter keeps running concurrently, and any error that
+      // is not aggregated follows the existing fail-fast path.
+      const aggregatedParams = paramsOptions
+        .filter(({ type }) => this.isParamErrorAggregatable(type))
+        .sort((a, b) => a.index - b.index);
+      const otherParams = paramsOptions.filter(
+        ({ type }) => !this.isParamErrorAggregatable(type),
+      );
+
+      const otherParamsPromise = Promise.all(
+        otherParams.map(param =>
+          resolveParamValue(param, args, req, res, next),
+        ),
+      );
+      // The promise is awaited again below; this no-op handler keeps a late
+      // rejection from surfacing as an unhandled rejection when the serial
+      // loop below bails out with a non-aggregated error first.
+      otherParamsPromise.catch(() => {});
+
+      const messages: string[] = [];
+      for (const param of aggregatedParams) {
+        try {
+          await resolveParamValue(param, args, req, res, next);
+        } catch (err) {
+          if (err instanceof BadRequestException) {
+            const paramMessages = this.getAggregatedMessages(err);
+            // A BadRequestException carrying no extractable message (e.g. a
+            // fully custom response body) cannot be represented in the
+            // aggregated array; let it take the existing path as-is.
+            if (paramMessages.length === 0) {
+              throw err;
+            }
+            messages.push(...paramMessages);
+          } else {
+            throw err;
+          }
+        }
+      }
+
+      // Errors from non-aggregated parameters take the existing path.
+      await otherParamsPromise;
+
+      if (messages.length) {
+        throw new BadRequestException(messages);
+      }
     };
     return paramsOptions.length ? pipesFn : null;
+  }
+
+  public isParamErrorAggregatable(type: number | string): boolean {
+    return type === RouteParamtypes.PARAM || type === RouteParamtypes.QUERY;
+  }
+
+  public getAggregatedMessages(exception: BadRequestException): string[] {
+    const response = exception.getResponse();
+    const message =
+      typeof response === 'object' && response !== null
+        ? (response as Record<string, unknown>).message
+        : response;
+    if (Array.isArray(message)) {
+      return message.filter(isString);
+    }
+    if (isString(message)) {
+      return [message];
+    }
+    return [exception.message];
   }
 
   public createHandleResponseFn(
