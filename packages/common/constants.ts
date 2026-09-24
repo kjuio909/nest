@@ -41,6 +41,7 @@ export const REDIRECT_METADATA = '__redirect__';
 export const RESPONSE_PASSTHROUGH_METADATA = '__responsePassthrough__';
 export const SSE_METADATA = '__sse__';
 export const VERSION_METADATA = '__version__';
+export const AGGREGATE_PARAM_ERRORS_METADATA = '__aggregateParamErrors__';
 export const INJECTABLE_WATERMARK = '__injectable__';
 export const CONTROLLER_WATERMARK = '__controller__';
 export const CATCH_WATERMARK = '__catch__';

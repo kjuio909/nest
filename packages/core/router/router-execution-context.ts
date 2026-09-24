@@ -5,6 +5,7 @@ import type {
 } from '@nestjs/common';
 import {
   type CanActivate,
+  BadRequestException,
   ForbiddenException,
   type HttpServer,
   type ParamData,
@@ -13,6 +14,7 @@ import {
   SSE_ABORT_CONTROLLER,
 } from '@nestjs/common';
 import {
+  AGGREGATE_PARAM_ERRORS_METADATA,
   type Controller,
   CUSTOM_ROUTE_ARGS_METADATA,
   HEADERS_METADATA,
@@ -104,6 +106,7 @@ export class RouterExecutionContext {
       httpStatusCode,
       responseHeaders,
       hasCustomHeaders,
+      aggregateParamErrors,
     } = this.getMetadata(
       instance,
       callback,
@@ -145,7 +148,11 @@ export class RouterExecutionContext {
       callback,
       contextType,
     );
-    const fnApplyPipes = this.createPipesFn(pipes, paramsOptions);
+    const fnApplyPipes = this.createPipesFn(
+      pipes,
+      paramsOptions,
+      aggregateParamErrors,
+    );
 
     const handler =
       <TRequest, TResponse>(
@@ -255,6 +262,8 @@ export class RouterExecutionContext {
     const httpStatusCode =
       httpCode ?? this.responseController.getStatusByMethod(requestMethod);
 
+    const aggregateParamErrors = this.reflectAggregateParamErrors(callback);
+
     const responseHeaders = this.reflectResponseHeaders(callback);
     const hasCustomHeaders = !isEmptyArray(responseHeaders);
     const handlerMetadata: HandlerMetadata = {
@@ -266,6 +275,7 @@ export class RouterExecutionContext {
       httpStatusCode,
       hasCustomHeaders,
       responseHeaders,
+      aggregateParamErrors,
     };
     this.handlerMetadataStorage.set(instance, methodName, handlerMetadata);
     return handlerMetadata;
@@ -297,6 +307,12 @@ export class RouterExecutionContext {
 
   public reflectSse(callback: (...args: unknown[]) => unknown): string {
     return Reflect.getMetadata(SSE_METADATA, callback);
+  }
+
+  public reflectAggregateParamErrors(
+    callback: (...args: unknown[]) => unknown,
+  ): boolean {
+    return !!Reflect.getMetadata(AGGREGATE_PARAM_ERRORS_METADATA, callback);
   }
 
   public exchangeKeysForValues(
@@ -372,6 +388,10 @@ export class RouterExecutionContext {
     );
   }
 
+  public isParamErrorAggregated(type: number | string): boolean {
+    return type === RouteParamtypes.PARAM || type === RouteParamtypes.QUERY;
+  }
+
   public createGuardsFn<TContext extends string = ContextType>(
     guards: CanActivate[],
     instance: Controller,
@@ -396,38 +416,90 @@ export class RouterExecutionContext {
   public createPipesFn(
     pipes: PipeTransform[],
     paramsOptions: (ParamProperties & { metatype?: any })[],
+    aggregateParamErrors = false,
   ) {
+    const resolveParamValue = async <TRequest, TResponse>(
+      param: ParamProperties & { metatype?: any },
+      args: any[],
+      req: TRequest,
+      res: TResponse,
+      next: Function,
+    ) => {
+      const {
+        index,
+        extractValue,
+        type,
+        data,
+        metatype,
+        pipes: paramPipes,
+        schema,
+      } = param;
+      const value = extractValue(req, res, next);
+
+      args[index] = this.isPipeable(type)
+        ? await this.getParamValue(
+            value,
+            { metatype, type, data, schema } as ArgumentMetadata,
+            pipes.concat(paramPipes),
+          )
+        : value;
+    };
+
     const pipesFn = async <TRequest, TResponse>(
       args: any[],
       req: TRequest,
       res: TResponse,
       next: Function,
     ) => {
-      const resolveParamValue = async (
-        param: ParamProperties & { metatype?: any },
-      ) => {
-        const {
-          index,
-          extractValue,
-          type,
-          data,
-          metatype,
-          pipes: paramPipes,
-          schema,
-        } = param;
-        const value = extractValue(req, res, next);
+      if (!aggregateParamErrors) {
+        await Promise.all(
+          paramsOptions.map(param =>
+            resolveParamValue(param, args, req, res, next),
+          ),
+        );
+        return;
+      }
 
-        args[index] = this.isPipeable(type)
-          ? await this.getParamValue(
-              value,
-              { metatype, type, data, schema } as ArgumentMetadata,
-              pipes.concat(paramPipes),
-            )
-          : value;
-      };
-      await Promise.all(paramsOptions.map(resolveParamValue));
+      // @Param()/@Query() pipes are executed serially, in parameter-index
+      // order, and their rejections are collected and rethrown as a single
+      // BadRequestException. Pipes bound to any other parameter keep the
+      // existing fail-fast path (their errors propagate immediately).
+      const orderedParams = [...paramsOptions].sort(
+        (a, b) => a.index - b.index,
+      );
+      const messages: unknown[] = [];
+      for (const param of orderedParams) {
+        if (!this.isParamErrorAggregated(param.type)) {
+          await resolveParamValue(param, args, req, res, next);
+          continue;
+        }
+        try {
+          await resolveParamValue(param, args, req, res, next);
+        } catch (err) {
+          // Only parameter validation errors are aggregated; any other
+          // exception keeps the existing fail-fast path.
+          if (!(err instanceof BadRequestException)) {
+            throw err;
+          }
+          messages.push(...this.extractParamErrorMessages(err));
+        }
+      }
+      if (messages.length > 0) {
+        throw new BadRequestException(messages);
+      }
     };
     return paramsOptions.length ? pipesFn : null;
+  }
+
+  private extractParamErrorMessages(error: BadRequestException): unknown[] {
+    const response = error.getResponse();
+    if (typeof response === 'object' && response !== null) {
+      const { message } = response as Record<string, unknown>;
+      if (message !== undefined) {
+        return Array.isArray(message) ? message : [message];
+      }
+    }
+    return [response];
   }
 
   public createHandleResponseFn(

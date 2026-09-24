@@ -1,12 +1,15 @@
-import { ForbiddenException } from '@nestjs/common/exceptions/forbidden.exception.js';
 import { EventEmitter } from 'events';
 import { of } from 'rxjs';
 import { PassThrough } from 'stream';
 import { CUSTOM_ROUTE_ARGS_METADATA } from '../../../common/constants.js';
 import { RouteParamtypes } from '../../../common/enums/route-paramtypes.enum.js';
 import {
+  AggregateParamErrors,
+  BadRequestException,
+  ForbiddenException,
   HttpException,
   HttpStatus,
+  PipeTransform,
   RouteParamMetadata,
 } from '../../../common/index.js';
 import { AbstractHttpAdapter } from '../../adapters/index.js';
@@ -333,7 +336,266 @@ describe('RouterExecutionContext', () => {
         expect(pipesFn).toBeNull();
       });
     });
+
+    const buildParam = (
+      index: number,
+      type: number,
+      value: unknown,
+      paramPipes: PipeTransform[] = [],
+    ) => ({
+      index,
+      type,
+      data: undefined,
+      pipes: paramPipes,
+      extractValue: () => value,
+    });
+
+    const throwingPipe = (message: string): PipeTransform => ({
+      transform: () => {
+        throw new BadRequestException(message);
+      },
+    });
+
+    describe('when "aggregateParamErrors" is not enabled', () => {
+      it('rejects with the first thrown exception (existing path)', async () => {
+        const pipesFn = contextCreator.createPipesFn(
+          [],
+          [
+            buildParam(0, RouteParamtypes.PARAM, 'abc', [throwingPipe('A')]),
+            buildParam(1, RouteParamtypes.QUERY, 'x', [throwingPipe('B')]),
+          ],
+        )!;
+
+        let error: BadRequestException;
+        try {
+          await pipesFn!([undefined, undefined], {}, {}, () => {});
+        } catch (e) {
+          error = e;
+        }
+        expect(error!).toBeInstanceOf(BadRequestException);
+        expect(error!.getResponse()).toEqual({
+          statusCode: HttpStatus.BAD_REQUEST,
+          error: 'Bad Request',
+          message: expect.stringMatching(/A|B/),
+        });
+      });
+    });
+
+    describe('when "aggregateParamErrors" is enabled', () => {
+      it('resolves all parameters when every pipe succeeds', async () => {
+        const pipesFn = contextCreator.createPipesFn(
+          [],
+          [
+            buildParam(0, RouteParamtypes.PARAM, '7'),
+            buildParam(1, RouteParamtypes.QUERY, '10'),
+          ],
+          true,
+        )!;
+        const args: unknown[] = [undefined, undefined];
+        await pipesFn(args, {}, {}, () => {});
+
+        expect(args).toEqual(['7', '10']);
+      });
+
+      it('throws a single BadRequestException with a one-element message on a single error', async () => {
+        const pipesFn = contextCreator.createPipesFn(
+          [],
+          [
+            buildParam(0, RouteParamtypes.PARAM, 'abc', [throwingPipe('A')]),
+            buildParam(1, RouteParamtypes.QUERY, '10'),
+          ],
+          true,
+        )!;
+
+        let error: BadRequestException;
+        try {
+          await pipesFn([undefined, undefined], {}, {}, () => {});
+        } catch (e) {
+          error = e;
+        }
+        expect(error!).toBeInstanceOf(BadRequestException);
+        expect(error!.getResponse()).toEqual({
+          statusCode: HttpStatus.BAD_REQUEST,
+          error: 'Bad Request',
+          message: ['A'],
+        });
+      });
+
+      it('collects @Param/@Query errors sorted by parameter index into one exception', async () => {
+        // Passed in reverse declaration order on purpose: aggregation must
+        // order messages by parameter index, not by metadata key order.
+        const pipesFn = contextCreator.createPipesFn(
+          [],
+          [
+            buildParam(1, RouteParamtypes.QUERY, 'x', [throwingPipe('B')]),
+            buildParam(0, RouteParamtypes.PARAM, 'abc', [throwingPipe('A')]),
+          ],
+          true,
+        )!;
+
+        let error: BadRequestException;
+        try {
+          await pipesFn([undefined, undefined], {}, {}, () => {});
+        } catch (e) {
+          error = e;
+        }
+        expect(error!).toBeInstanceOf(BadRequestException);
+        expect(error!.getResponse()).toEqual({
+          statusCode: HttpStatus.BAD_REQUEST,
+          error: 'Bad Request',
+          message: ['A', 'B'],
+        });
+      });
+
+      it('runs the aggregated parameter pipes serially', async () => {
+        const started: string[] = [];
+        let releaseFirst: () => void;
+        const slowPipe: PipeTransform = {
+          transform: () =>
+            new Promise(resolve => {
+              started.push('first');
+              releaseFirst = () => resolve('7');
+            }),
+        };
+        const secondPipe: PipeTransform = {
+          transform: async (value: unknown) => {
+            started.push('second');
+            return value;
+          },
+        };
+
+        const pipesFn = contextCreator.createPipesFn(
+          [],
+          [
+            buildParam(0, RouteParamtypes.PARAM, '7', [slowPipe]),
+            buildParam(1, RouteParamtypes.QUERY, '10', [secondPipe]),
+          ],
+          true,
+        )!;
+
+        const promise = pipesFn([undefined, undefined], {}, {}, () => {});
+        await Promise.resolve();
+        expect(started).toEqual(['first']);
+
+        releaseFirst!();
+        await promise;
+        expect(started).toEqual(['first', 'second']);
+      });
+
+      it('lets errors of non-aggregated parameters (e.g. @Body) propagate immediately', async () => {
+        const pipesFn = contextCreator.createPipesFn(
+          [],
+          [
+            buildParam(0, RouteParamtypes.PARAM, 'abc', [throwingPipe('A')]),
+            buildParam(1, RouteParamtypes.BODY, {}, [throwingPipe('BODY')]),
+          ],
+          true,
+        )!;
+
+        let error: BadRequestException;
+        try {
+          await pipesFn([undefined, undefined], {}, {}, () => {});
+        } catch (e) {
+          error = e;
+        }
+        expect(error!).toBeInstanceOf(BadRequestException);
+        expect(error!.getResponse()).toEqual({
+          statusCode: HttpStatus.BAD_REQUEST,
+          error: 'Bad Request',
+          message: 'BODY',
+        });
+      });
+
+      it('does not aggregate non-BadRequest errors: the original exception propagates immediately', async () => {
+        const plainErrorPipe: PipeTransform = {
+          transform: () => {
+            throw new Error('boom');
+          },
+        };
+        const pipesFn = contextCreator.createPipesFn(
+          [],
+          [
+            buildParam(0, RouteParamtypes.PARAM, 'abc', [plainErrorPipe]),
+            buildParam(1, RouteParamtypes.QUERY, 'x', [throwingPipe('B')]),
+          ],
+          true,
+        )!;
+
+        await expect(
+          pipesFn([undefined, undefined], {}, {}, () => {}),
+        ).rejects.toThrow('boom');
+      });
+
+      it('does not aggregate non-BadRequest HttpExceptions either', async () => {
+        const notFoundPipe: PipeTransform = {
+          transform: () => {
+            throw new HttpException('missing', HttpStatus.NOT_FOUND);
+          },
+        };
+        const pipesFn = contextCreator.createPipesFn(
+          [],
+          [
+            buildParam(0, RouteParamtypes.PARAM, 'abc', [notFoundPipe]),
+            buildParam(1, RouteParamtypes.QUERY, 'x', [throwingPipe('B')]),
+          ],
+          true,
+        )!;
+
+        await expect(
+          pipesFn([undefined, undefined], {}, {}, () => {}),
+        ).rejects.toMatchObject({
+          status: HttpStatus.NOT_FOUND,
+        });
+      });
+
+      it('preserves array messages from BadRequestExceptions', async () => {
+        const validationPipe: PipeTransform = {
+          transform: () => {
+            throw new BadRequestException(['one', 'two']);
+          },
+        };
+        const pipesFn = contextCreator.createPipesFn(
+          [],
+          [
+            buildParam(0, RouteParamtypes.PARAM, 'abc', [validationPipe]),
+            buildParam(1, RouteParamtypes.QUERY, 'x', [throwingPipe('B')]),
+          ],
+          true,
+        )!;
+
+        let error: BadRequestException;
+        try {
+          await pipesFn([undefined, undefined], {}, {}, () => {});
+        } catch (e) {
+          error = e;
+        }
+        expect((error!.getResponse() as any).message).toEqual([
+          'one',
+          'two',
+          'B',
+        ]);
+      });
+    });
   });
+  describe('reflectAggregateParamErrors', () => {
+    it('returns false when metadata is not present', () => {
+      const callback = () => {};
+      expect(contextCreator.reflectAggregateParamErrors(callback)).toBe(false);
+    });
+
+    it('returns true when the method is annotated', () => {
+      class TestController {
+        @AggregateParamErrors()
+        public callback() {}
+      }
+      expect(
+        contextCreator.reflectAggregateParamErrors(
+          TestController.prototype.callback,
+        ),
+      ).toBe(true);
+    });
+  });
+
   describe('createGuardsFn', () => {
     it('should throw ForbiddenException when "tryActivate" returns false', async () => {
       const guardsFn = contextCreator.createGuardsFn([null!], null!, null!)!;
