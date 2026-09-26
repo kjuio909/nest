@@ -4,6 +4,7 @@ import {
   BadRequestException,
   Body,
   Catch,
+  ConflictException,
   Controller,
   createParamDecorator,
   DefaultValuePipe,
@@ -129,6 +130,45 @@ class CurrencyPipe implements PipeTransform<string | undefined, string> {
   }
 }
 
+// Converts a repeatable `item` query key (`?item=2&item=4`) one element at a
+// time, in appearance order. Conversion errors are aggregated and stay
+// indexable (ITEM[0], ITEM[2], ...); `deny` is not a request-parameter error
+// but a conflict that aborts the resolution immediately.
+class BatchItemsPipe implements PipeTransform<
+  string[] | string | undefined,
+  number[]
+> {
+  transform(value: string[] | string | undefined): number[] {
+    if (value === undefined) {
+      // The key is entirely absent: one unindexed message, distinct from an
+      // explicit empty value (which exists as element 0 and fails as ITEM[0]).
+      isolationState.pipeCalls.push('ITEM');
+      throw new BadRequestException(['ITEM']);
+    }
+    const items = Array.isArray(value) ? value : [value];
+    const numbers: number[] = [];
+    const messages: string[] = [];
+    items.forEach((raw, index) => {
+      isolationState.pipeCalls.push('ITEM');
+      if (raw === 'deny') {
+        // Non-request error: stop touching the remaining elements and abort
+        // the whole parameter resolution; messages staged earlier are dropped.
+        throw new ConflictException('DENIED');
+      }
+      const parsed = Number(raw);
+      if (raw.trim() === '' || Number.isNaN(parsed)) {
+        messages.push(`ITEM[${index}]`);
+        return;
+      }
+      numbers.push(parsed);
+    });
+    if (messages.length > 0) {
+      throw new BadRequestException(messages);
+    }
+    return numbers;
+  }
+}
+
 class NotFoundPipe implements PipeTransform<string, string> {
   transform(value: string): string {
     isolationState.pipeCalls.push('N');
@@ -195,6 +235,35 @@ class HeaderAbortPipe implements PipeTransform<string | undefined, string> {
       throw new ForbiddenException('HEADER-ABORT');
     }
     return value ?? '';
+  }
+}
+
+// Fail-fast counterpart used by the unannotated compatibility route: it stops
+// at the first non-convertible element and throws one plain (single) error,
+// mirroring the legacy short-circuit semantics of any ordinary parameter pipe.
+class BatchItemsFailFastPipe implements PipeTransform<
+  string[] | string | undefined,
+  number[]
+> {
+  transform(value: string[] | string | undefined): number[] {
+    if (value === undefined) {
+      throw new BadRequestException('ITEM');
+    }
+    const items = Array.isArray(value) ? value : [value];
+    const numbers: number[] = [];
+    for (let index = 0; index < items.length; index++) {
+      isolationState.pipeCalls.push('ITEM');
+      const raw = items[index];
+      if (raw === 'deny') {
+        throw new ConflictException('DENIED');
+      }
+      const parsed = Number(raw);
+      if (raw.trim() === '' || Number.isNaN(parsed)) {
+        throw new BadRequestException(`ITEM[${index}]`);
+      }
+      numbers.push(parsed);
+    }
+    return numbers;
   }
 }
 
@@ -453,5 +522,30 @@ export class AggregateParamErrorsController {
   ) {
     recordHandler('defaultsSlow');
     return { id, currency, limit };
+  }
+}
+
+// Root-level controller for the repeatable-query-key batch routes. The marked
+// route aggregates the per-element conversion feedback of a single request;
+// the unannotated route keeps the legacy fail-fast short-circuit for contrast.
+@Controller()
+export class BatchController {
+  @AggregateParamErrors()
+  @Get('batch/:id')
+  public batch(
+    @Param('id', new NumberPipe('A')) id: number,
+    @Query('item', new BatchItemsPipe()) items: number[],
+  ) {
+    recordHandler('batch');
+    return { id, items };
+  }
+
+  @Get('batch-legacy/:id')
+  public batchLegacy(
+    @Param('id', new NumberPipe('A')) id: number,
+    @Query('item', new BatchItemsFailFastPipe()) items: number[],
+  ) {
+    recordHandler('batchLegacy');
+    return { id, items };
   }
 }

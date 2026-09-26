@@ -174,11 +174,7 @@ export function registerIsolationSuite(deps: IsolationSuiteDeps): void {
           '/p/defaults/abc?currency=&limit=x',
         );
         expect(doubleError.status).toBe(400);
-        expect(doubleError.body.message).toEqual([
-          'A',
-          'CURRENCY',
-          'LIMIT',
-        ]);
+        expect(doubleError.body.message).toEqual(['A', 'CURRENCY', 'LIMIT']);
         expect(isolationState.handlerCalls.defaults).toBe(2);
 
         const defaultedAgain = await request(
@@ -196,11 +192,21 @@ export function registerIsolationSuite(deps: IsolationSuiteDeps): void {
         // Every request re-ran all three conversions; the default, converted
         // values and collected errors never crossed request boundaries.
         expect(isolationState.pipeCalls).toEqual([
-          'A', 'CURRENCY', 'LIMIT',
-          'A', 'CURRENCY', 'LIMIT',
-          'A', 'CURRENCY', 'LIMIT',
-          'A', 'CURRENCY', 'LIMIT',
-          'A', 'CURRENCY', 'LIMIT',
+          'A',
+          'CURRENCY',
+          'LIMIT',
+          'A',
+          'CURRENCY',
+          'LIMIT',
+          'A',
+          'CURRENCY',
+          'LIMIT',
+          'A',
+          'CURRENCY',
+          'LIMIT',
+          'A',
+          'CURRENCY',
+          'LIMIT',
         ]);
       });
 
@@ -477,10 +483,16 @@ export function registerIsolationSuite(deps: IsolationSuiteDeps): void {
         // The header failures stopped at 'H' (the trailing @Query() pipe never
         // ran); no response carried messages collected by another response.
         expect(isolationState.pipeCalls).toEqual([
-          'A', 'H', 'B',
-          'A', 'H', 'B',
-          'A', 'H',
-          'A', 'H',
+          'A',
+          'H',
+          'B',
+          'A',
+          'H',
+          'B',
+          'A',
+          'H',
+          'A',
+          'H',
         ]);
       });
     });
@@ -562,6 +574,203 @@ export function registerIsolationSuite(deps: IsolationSuiteDeps): void {
         expect(
           isolationState.pipeCalls.filter(tag => tag === 'B'),
         ).toHaveLength(1);
+      });
+    });
+
+    describe('repeatable query values on the aggregated batch route', () => {
+      it('converts every repeated item in appearance order and keeps the array shape for a single value', async () => {
+        const multi = await request('GET', '/batch/7?item=2&item=4');
+        expect(multi.status).toBe(200);
+        expect(multi.body).toEqual({ id: 7, items: [2, 4] });
+        expect(isolationState.handlerCalls.batch).toBe(1);
+        expect(isolationState.pipeCalls).toEqual(['A', 'ITEM', 'ITEM']);
+
+        const single = await request('GET', '/batch/8?item=9');
+        expect(single.status).toBe(200);
+        expect(single.body).toEqual({ id: 8, items: [9] });
+        expect(isolationState.handlerCalls.batch).toBe(2);
+      });
+
+      it('reports a single invalid element as a one-element indexed message and skips the handler', async () => {
+        const failed = await request('GET', '/batch/7?item=x');
+        expect(failed.status).toBe(400);
+        expect(failed.body).toEqual({
+          statusCode: 400,
+          error: 'Bad Request',
+          message: ['ITEM[0]'],
+        });
+        expect(isolationState.handlerCalls.batch ?? 0).toBe(0);
+      });
+
+      it('keeps checking the remaining elements and returns all indexed messages in original order', async () => {
+        const failed = await request('GET', '/batch/7?item=x&item=3&item=y');
+        expect(failed.status).toBe(400);
+        expect(failed.body.message).toEqual(['ITEM[0]', 'ITEM[2]']);
+        expect(isolationState.handlerCalls.batch ?? 0).toBe(0);
+        // All three elements were inspected; the valid middle one converted.
+        expect(isolationState.pipeCalls).toEqual(['A', 'ITEM', 'ITEM', 'ITEM']);
+      });
+
+      it('reports only the invalid index while later valid elements are still converted', async () => {
+        const failed = await request('GET', '/batch/7?item=&item=2');
+        expect(failed.status).toBe(400);
+        expect(failed.body.message).toEqual(['ITEM[0]']);
+      });
+
+      it('reports an unindexed message when the item key is entirely absent', async () => {
+        const failed = await request('GET', '/batch/7');
+        expect(failed.status).toBe(400);
+        expect(failed.body).toEqual({
+          statusCode: 400,
+          error: 'Bad Request',
+          message: ['ITEM'],
+        });
+        expect(isolationState.handlerCalls.batch ?? 0).toBe(0);
+      });
+
+      it('treats an explicit empty value as an existing invalid element, never as a missing key', async () => {
+        const failed = await request('GET', '/batch/7?item=');
+        expect(failed.status).toBe(400);
+        expect(failed.body).toEqual({
+          statusCode: 400,
+          error: 'Bad Request',
+          message: ['ITEM[0]'],
+        });
+        expect(isolationState.handlerCalls.batch ?? 0).toBe(0);
+      });
+
+      it('aggregates a failing path parameter together with the indexed item messages', async () => {
+        const failed = await request('GET', '/batch/abc?item=x');
+        expect(failed.status).toBe(400);
+        expect(failed.body.message).toEqual(['A', 'ITEM[0]']);
+        expect(isolationState.handlerCalls.batch ?? 0).toBe(0);
+      });
+
+      it('aborts with 409 DENIED on a deny value, never inspects later elements and discards staged errors', async () => {
+        const denied = await request('GET', '/batch/7?item=x&item=deny&item=y');
+        expect(denied.status).toBe(409);
+        expect(denied.body).toEqual({
+          statusCode: 409,
+          error: 'Conflict',
+          message: 'DENIED',
+        });
+        expect(isolationState.handlerCalls.batch ?? 0).toBe(0);
+        // The first element staged ITEM[0], `deny` aborted, the trailing
+        // element was never inspected and the staged message was discarded.
+        expect(isolationState.pipeCalls).toEqual(['A', 'ITEM', 'ITEM']);
+      });
+
+      it('discards a staged path-parameter error as well when deny aborts the request', async () => {
+        const denied = await request('GET', '/batch/abc?item=deny');
+        expect(denied.status).toBe(409);
+        expect(denied.body.message).toBe('DENIED');
+        expect(isolationState.handlerCalls.batch ?? 0).toBe(0);
+      });
+
+      it('keeps success, single-error, multi-error, missing and deny responses isolated across an interleaved sequence', async () => {
+        const success = await request('GET', '/batch/7?item=2&item=4');
+        expect(success.status).toBe(200);
+        expect(success.body).toEqual({ id: 7, items: [2, 4] });
+
+        const singleError = await request('GET', '/batch/7?item=x');
+        expect(singleError.status).toBe(400);
+        expect(singleError.body.message).toEqual(['ITEM[0]']);
+
+        const multiError = await request(
+          'GET',
+          '/batch/7?item=x&item=3&item=y',
+        );
+        expect(multiError.status).toBe(400);
+        expect(multiError.body.message).toEqual(['ITEM[0]', 'ITEM[2]']);
+
+        const missing = await request('GET', '/batch/7');
+        expect(missing.status).toBe(400);
+        expect(missing.body.message).toEqual(['ITEM']);
+
+        const denied = await request('GET', '/batch/7?item=x&item=deny&item=y');
+        expect(denied.status).toBe(409);
+        expect(denied.body.message).toBe('DENIED');
+
+        const successAgain = await request('GET', '/batch/9?item=11');
+        expect(successAgain.status).toBe(200);
+        expect(successAgain.body).toEqual({ id: 9, items: [11] });
+
+        // Only the two all-successful requests reached the handler; arrays,
+        // messages and statuses were each decided by that request alone.
+        expect(isolationState.handlerCalls.batch).toBe(2);
+        expect(isolationState.pipeCalls).toEqual([
+          'A',
+          'ITEM',
+          'ITEM',
+          'A',
+          'ITEM',
+          'A',
+          'ITEM',
+          'ITEM',
+          'ITEM',
+          'A',
+          'ITEM',
+          'A',
+          'ITEM',
+          'ITEM',
+          'A',
+          'ITEM',
+        ]);
+      });
+
+      it('keeps parallel success, multi-error and deny requests isolated', async () => {
+        const [success, multiError, denied] = await Promise.all([
+          request('GET', '/batch/7?item=2&item=4'),
+          request('GET', '/batch/7?item=x&item=3&item=y'),
+          request('GET', '/batch/7?item=x&item=deny&item=y'),
+        ]);
+
+        expect(success.status).toBe(200);
+        expect(success.body).toEqual({ id: 7, items: [2, 4] });
+        expect(multiError.status).toBe(400);
+        expect(multiError.body.message).toEqual(['ITEM[0]', 'ITEM[2]']);
+        expect(denied.status).toBe(409);
+        expect(denied.body.message).toBe('DENIED');
+
+        // Exactly one request converted successfully and reached the handler.
+        expect(isolationState.handlerCalls.batch).toBe(1);
+      });
+    });
+
+    describe('unannotated batch compatibility route', () => {
+      it('still serves a valid batch with the array shape', async () => {
+        const ok = await request('GET', '/batch-legacy/7?item=2&item=4');
+        expect(ok.status).toBe(200);
+        expect(ok.body).toEqual({ id: 7, items: [2, 4] });
+        expect(isolationState.handlerCalls.batchLegacy).toBe(1);
+      });
+
+      it('stops at the first invalid element and returns one single-error body', async () => {
+        const failed = await request(
+          'GET',
+          '/batch-legacy/7?item=x&item=3&item=y',
+        );
+        expect(failed.status).toBe(400);
+        expect(failed.body).toEqual({
+          statusCode: 400,
+          error: 'Bad Request',
+          message: 'ITEM[0]',
+        });
+        expect(isolationState.handlerCalls.batchLegacy ?? 0).toBe(0);
+      });
+
+      it('reports a missing item key as a plain single error', async () => {
+        const failed = await request('GET', '/batch-legacy/7');
+        expect(failed.status).toBe(400);
+        expect(failed.body.message).toBe('ITEM');
+        expect(isolationState.handlerCalls.batchLegacy ?? 0).toBe(0);
+      });
+
+      it('keeps the deny short-circuit (409 DENIED) on the legacy path', async () => {
+        const denied = await request('GET', '/batch-legacy/7?item=deny');
+        expect(denied.status).toBe(409);
+        expect(denied.body.message).toBe('DENIED');
+        expect(isolationState.handlerCalls.batchLegacy ?? 0).toBe(0);
       });
     });
 
