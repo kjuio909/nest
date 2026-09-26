@@ -355,18 +355,134 @@ export function UploadedFiles(
 /**
  * Route handler parameter decorator. Extracts the `headers`
  * property from the `req` object and populates the decorated
- * parameter with the value of `headers`.
+ * parameter with the value of `headers`. May also apply pipes to the bound
+ * header parameter.
  *
  * For example: `async update(@Headers('Cache-Control') cacheControl: string)`
  *
  * @param property name of single header property to extract.
+ * @param pipes one or more pipes to apply to the bound header parameter
  *
  * @see [Request object](https://docs.nestjs.com/controllers#request-object)
  *
  * @publicApi
  */
-export const Headers: (property?: string) => ParameterDecorator =
-  createRouteParamDecorator(RouteParamtypes.HEADERS);
+export function Headers(): ParameterDecorator;
+/**
+ * Route handler parameter decorator. Extracts the `headers`
+ * property from the `req` object and populates the decorated
+ * parameter with the value of `headers`. May also apply pipes to the bound
+ * header parameter.
+ *
+ * For example: `async update(@Headers('Cache-Control') cacheControl: string)`
+ *
+ * @param property name of single header property to extract.
+ * @param pipes one or more pipes to apply to the bound header parameter
+ *
+ * @see [Request object](https://docs.nestjs.com/controllers#request-object)
+ *
+ * @publicApi
+ */
+export function Headers(
+  ...pipes: (Type<PipeTransform> | PipeTransform)[]
+): ParameterDecorator;
+/**
+ * Route handler parameter decorator. Extracts the `headers`
+ * property from the `req` object and populates the decorated
+ * parameter with the value of `headers`. May also apply pipes to the bound
+ * header parameter.
+ *
+ * For example: `async update(@Headers('Cache-Control') cacheControl: string)`
+ *
+ * @param property name of single header property to extract.
+ * @param pipes one or more pipes to apply to the bound header parameter
+ *
+ * @see [Request object](https://docs.nestjs.com/controllers#request-object)
+ *
+ * @publicApi
+ */
+export function Headers(
+  property: string,
+  ...pipes: (Type<PipeTransform> | PipeTransform)[]
+): ParameterDecorator;
+/**
+ * Route handler parameter decorator. Extracts the `headers`
+ * property from the `req` object and populates the decorated
+ * parameter with the value of `headers`. May also apply pipes to the bound
+ * header parameter.
+ *
+ * For example: `async update(@Headers('Cache-Control') cacheControl: string)`
+ *
+ * @param property name of single header property to extract.
+ * @param options options object containing additional configuration for the decorator, such as pipes and schema
+ *
+ * @see [Request object](https://docs.nestjs.com/controllers#request-object)
+ *
+ * @publicApi
+ */
+export function Headers(
+  property: string,
+  options: ParameterDecoratorOptions,
+): ParameterDecorator;
+/**
+ * Route handler parameter decorator. Extracts the `headers`
+ * property from the `req` object and populates the decorated
+ * parameter with the value of `headers`. May also apply pipes to the bound
+ * header parameter.
+ *
+ * For example: `async update(@Headers('Cache-Control') cacheControl: string)`
+ *
+ * @param options options object containing additional configuration for the decorator, such as pipes and schema
+ *
+ * @see [Request object](https://docs.nestjs.com/controllers#request-object)
+ *
+ * @publicApi
+ */
+export function Headers(options: ParameterDecoratorOptions): ParameterDecorator;
+/**
+ * Route handler parameter decorator. Extracts the `headers`
+ * property from the `req` object and populates the decorated
+ * parameter with the value of `headers`. May also apply pipes to the bound
+ * header parameter.
+ *
+ * For example: `async update(@Headers('Cache-Control') cacheControl: string)`
+ *
+ * @param property name of single header property to extract.
+ * @param optionsOrPipe one or more pipes to apply to the bound header parameter or options object
+ * @param pipes one or more pipes to apply to the bound header parameter
+ *
+ * @see [Request object](https://docs.nestjs.com/controllers#request-object)
+ *
+ * @publicApi
+ */
+export function Headers(
+  property?:
+    string | (Type<PipeTransform> | PipeTransform) | ParameterDecoratorOptions,
+  optionsOrPipe?:
+    ParameterDecoratorOptions | Type<PipeTransform> | PipeTransform,
+  ...pipes: (Type<PipeTransform> | PipeTransform)[]
+): ParameterDecorator {
+  const isPropertyOptions = isParameterDecoratorOptions(property);
+
+  if (isPropertyOptions) {
+    return createPipesRouteParamDecorator(RouteParamtypes.HEADERS)({
+      pipes: property.pipes,
+      schema: property.schema,
+    });
+  }
+
+  const isOptions = isParameterDecoratorOptions(optionsOrPipe);
+  const actualPipes = isOptions
+    ? [...(optionsOrPipe.pipes ?? []), ...pipes]
+    : ([optionsOrPipe, ...pipes].filter(Boolean) as (
+        Type<PipeTransform> | PipeTransform
+      )[]);
+  return createPipesRouteParamDecorator(RouteParamtypes.HEADERS)({
+    data: property,
+    pipes: actualPipes,
+    schema: isOptions ? optionsOrPipe.schema : undefined,
+  });
+}
 
 /**
  * Route handler parameter decorator. Extracts the `query`
@@ -491,13 +607,9 @@ export function Query(options: ParameterDecoratorOptions): ParameterDecorator;
  */
 export function Query(
   property?:
-    | string
-    | (Type<PipeTransform> | PipeTransform)
-    | ParameterDecoratorOptions,
+    string | (Type<PipeTransform> | PipeTransform) | ParameterDecoratorOptions,
   optionsOrPipe?:
-    | ParameterDecoratorOptions
-    | Type<PipeTransform>
-    | PipeTransform,
+    ParameterDecoratorOptions | Type<PipeTransform> | PipeTransform,
   ...pipes: (Type<PipeTransform> | PipeTransform)[]
 ): ParameterDecorator {
   const isPropertyOptions = isParameterDecoratorOptions(property);
@@ -513,8 +625,7 @@ export function Query(
   const actualPipes = isOptions
     ? [...(optionsOrPipe.pipes ?? []), ...pipes]
     : ([optionsOrPipe, ...pipes].filter(Boolean) as (
-        | Type<PipeTransform>
-        | PipeTransform
+        Type<PipeTransform> | PipeTransform
       )[]);
   return createPipesRouteParamDecorator(RouteParamtypes.QUERY)({
     data: property,
@@ -647,13 +758,9 @@ export function Body(
  */
 export function Body(
   property?:
-    | string
-    | (Type<PipeTransform> | PipeTransform)
-    | ParameterDecoratorOptions,
+    string | (Type<PipeTransform> | PipeTransform) | ParameterDecoratorOptions,
   optionsOrPipe?:
-    | ParameterDecoratorOptions
-    | Type<PipeTransform>
-    | PipeTransform,
+    ParameterDecoratorOptions | Type<PipeTransform> | PipeTransform,
   ...pipes: (Type<PipeTransform> | PipeTransform)[]
 ): ParameterDecorator {
   const isPropertyOptions = isParameterDecoratorOptions(property);
@@ -669,8 +776,7 @@ export function Body(
   const actualPipes = isOptions
     ? [...(optionsOrPipe.pipes ?? []), ...pipes]
     : ([optionsOrPipe, ...pipes].filter(Boolean) as (
-        | Type<PipeTransform>
-        | PipeTransform
+        Type<PipeTransform> | PipeTransform
       )[]);
   return createPipesRouteParamDecorator(RouteParamtypes.BODY)({
     data: property,
@@ -716,8 +822,7 @@ export function RawBody(): ParameterDecorator;
  */
 export function RawBody(
   ...pipes: (
-    | Type<PipeTransform<Buffer | undefined>>
-    | PipeTransform<Buffer | undefined>
+    Type<PipeTransform<Buffer | undefined>> | PipeTransform<Buffer | undefined>
   )[]
 ): ParameterDecorator;
 
@@ -767,16 +872,14 @@ export function RawBody(
     | Type<PipeTransform<Buffer | undefined>>
     | PipeTransform<Buffer | undefined>,
   ...pipes: (
-    | Type<PipeTransform<Buffer | undefined>>
-    | PipeTransform<Buffer | undefined>
+    Type<PipeTransform<Buffer | undefined>> | PipeTransform<Buffer | undefined>
   )[]
 ): ParameterDecorator {
   const isOptions = isParameterDecoratorOptions(optionsOrPipe);
   const actualPipes = isOptions
     ? [...(optionsOrPipe.pipes ?? []), ...pipes]
     : ([optionsOrPipe, ...pipes].filter(Boolean) as (
-        | Type<PipeTransform>
-        | PipeTransform
+        Type<PipeTransform> | PipeTransform
       )[]);
   return createPipesRouteParamDecorator(RouteParamtypes.RAW_BODY)({
     pipes: actualPipes,
@@ -932,13 +1035,9 @@ export function Param(options: ParameterDecoratorOptions): ParameterDecorator;
  */
 export function Param(
   property?:
-    | string
-    | (Type<PipeTransform> | PipeTransform)
-    | ParameterDecoratorOptions,
+    string | (Type<PipeTransform> | PipeTransform) | ParameterDecoratorOptions,
   optionsOrPipe?:
-    | ParameterDecoratorOptions
-    | Type<PipeTransform>
-    | PipeTransform,
+    ParameterDecoratorOptions | Type<PipeTransform> | PipeTransform,
   ...pipes: (Type<PipeTransform> | PipeTransform)[]
 ): ParameterDecorator {
   const isPropertyOptions = isParameterDecoratorOptions(property);
@@ -954,8 +1053,7 @@ export function Param(
   const actualPipes = isOptions
     ? [...(optionsOrPipe.pipes ?? []), ...pipes]
     : ([optionsOrPipe, ...pipes].filter(Boolean) as (
-        | Type<PipeTransform>
-        | PipeTransform
+        Type<PipeTransform> | PipeTransform
       )[]);
   return createPipesRouteParamDecorator(RouteParamtypes.PARAM)({
     data: property,

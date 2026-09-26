@@ -379,6 +379,22 @@ describe('RouterExecutionContext', () => {
           message: expect.stringMatching(/A|B/),
         });
       });
+
+      it('does not run @Headers() pipes (existing pipe-less behavior)', async () => {
+        const headerPipe: PipeTransform = {
+          transform: () => {
+            throw new BadRequestException('H');
+          },
+        };
+        const pipesFn = contextCreator.createPipesFn(
+          [],
+          [buildParam(0, RouteParamtypes.HEADERS, 'raw', [headerPipe])],
+        )!;
+
+        const args: unknown[] = [undefined];
+        await pipesFn(args, {}, {}, () => {});
+        expect(args).toEqual(['raw']);
+      });
     });
 
     describe('when "aggregateParamErrors" is enabled', () => {
@@ -769,6 +785,111 @@ describe('RouterExecutionContext', () => {
           // The 'A' collected by the aborted call was discarded; the second
           // call ran all three pipes from scratch and resolved cleanly.
           expect(calls).toEqual(['A', 'M', 'A', 'M', 'B']);
+        });
+      });
+
+      describe('@Headers() input domain', () => {
+        const headerTokenPipe: PipeTransform = {
+          transform: (value: unknown) => {
+            if (value === 'invalid') {
+              throw new BadRequestException('H');
+            }
+            return `token:${value}`;
+          },
+        };
+
+        it('runs the header pipe and resolves every transformed value together', async () => {
+          const pipesFn = contextCreator.createPipesFn(
+            [],
+            [
+              buildParam(0, RouteParamtypes.PARAM, '7'),
+              buildParam(1, RouteParamtypes.QUERY, '10'),
+              buildParam(2, RouteParamtypes.HEADERS, 'abc', [headerTokenPipe]),
+            ],
+            true,
+          )!;
+          const args: unknown[] = [undefined, undefined, undefined];
+          await pipesFn(args, {}, {}, () => {});
+
+          expect(args).toEqual(['7', '10', 'token:abc']);
+        });
+
+        it('discards the collected @Param/@Query messages when the header pipe fails', async () => {
+          const pipesFn = contextCreator.createPipesFn(
+            [],
+            [
+              buildParam(0, RouteParamtypes.PARAM, 'abc', [throwingPipe('A')]),
+              buildParam(1, RouteParamtypes.QUERY, 'x', [throwingPipe('B')]),
+              buildParam(2, RouteParamtypes.HEADERS, 'invalid', [
+                headerTokenPipe,
+              ]),
+            ],
+            true,
+          )!;
+
+          let error: BadRequestException;
+          try {
+            await pipesFn([undefined, undefined, undefined], {}, {}, () => {});
+          } catch (e) {
+            error = e;
+          }
+          // The exception is the header one, unchanged: the collected 'A'/'B'
+          // messages never reach the response.
+          expect(error!).toBeInstanceOf(BadRequestException);
+          expect(error!.getResponse()).toEqual({
+            statusCode: HttpStatus.BAD_REQUEST,
+            error: 'Bad Request',
+            message: 'H',
+          });
+        });
+
+        it('ends the resolution immediately when the header pipe fails first', async () => {
+          const calls: string[] = [];
+          const trackingPipe = (tag: string): PipeTransform => ({
+            transform: (value: unknown) => {
+              calls.push(tag);
+              return value;
+            },
+          });
+          const pipesFn = contextCreator.createPipesFn(
+            [],
+            [
+              buildParam(0, RouteParamtypes.HEADERS, 'invalid', [
+                headerTokenPipe,
+              ]),
+              buildParam(1, RouteParamtypes.PARAM, 'abc', [trackingPipe('A')]),
+              buildParam(2, RouteParamtypes.QUERY, 'x', [trackingPipe('B')]),
+            ],
+            true,
+          )!;
+
+          await expect(
+            pipesFn([undefined, undefined, undefined], {}, {}, () => {}),
+          ).rejects.toBeInstanceOf(BadRequestException);
+          // The header parameter aborted the resolution: the @Param()/@Query()
+          // pipes never ran for this call.
+          expect(calls).toEqual([]);
+        });
+
+        it('aggregates only the @Param/@Query messages when the header pipe succeeds', async () => {
+          const pipesFn = contextCreator.createPipesFn(
+            [],
+            [
+              buildParam(0, RouteParamtypes.PARAM, 'abc', [throwingPipe('A')]),
+              buildParam(1, RouteParamtypes.QUERY, 'x', [throwingPipe('B')]),
+              buildParam(2, RouteParamtypes.HEADERS, 'abc', [headerTokenPipe]),
+            ],
+            true,
+          )!;
+
+          let error: BadRequestException;
+          try {
+            await pipesFn([undefined, undefined, undefined], {}, {}, () => {});
+          } catch (e) {
+            error = e;
+          }
+          expect(error!).toBeInstanceOf(BadRequestException);
+          expect((error!.getResponse() as any).message).toEqual(['A', 'B']);
         });
       });
     });

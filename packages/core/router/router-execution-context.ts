@@ -392,6 +392,10 @@ export class RouterExecutionContext {
     return type === RouteParamtypes.PARAM || type === RouteParamtypes.QUERY;
   }
 
+  public isHeaderParam(type: number | string): boolean {
+    return type === RouteParamtypes.HEADERS;
+  }
+
   public createGuardsFn<TContext extends string = ContextType>(
     guards: CanActivate[],
     instance: Controller,
@@ -436,7 +440,14 @@ export class RouterExecutionContext {
       } = param;
       const value = extractValue(req, res, next);
 
-      args[index] = this.isPipeable(type)
+      // Explicitly-read headers (`@Headers()`) form an independent input
+      // domain: their pipes only run when the handler aggregates parameter
+      // errors. Everywhere else header parameters keep the existing
+      // (pipe-less) behavior so unmarked routes stay untouched.
+      const pipeable =
+        this.isPipeable(type) ||
+        (aggregateParamErrors && this.isHeaderParam(type));
+      args[index] = pipeable
         ? await this.getParamValue(
             value,
             { metatype, type, data, schema } as ArgumentMetadata,
@@ -463,7 +474,10 @@ export class RouterExecutionContext {
       // @Param()/@Query() pipes are executed serially, in parameter-index
       // order, and their rejections are collected and rethrown as a single
       // BadRequestException. Pipes bound to any other parameter keep the
-      // existing fail-fast path (their errors propagate immediately).
+      // existing fail-fast path (their errors propagate immediately). In
+      // particular, a failing @Headers() pipe aborts the resolution at once:
+      // the messages collected so far are discarded and the exception filters
+      // only ever observe the header exception.
       const orderedParams = [...paramsOptions].sort(
         (a, b) => a.index - b.index,
       );

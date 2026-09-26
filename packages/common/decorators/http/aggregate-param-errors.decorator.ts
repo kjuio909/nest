@@ -16,6 +16,13 @@ import { AGGREGATE_PARAM_ERRORS_METADATA } from '../../constants.js';
  * ...) and handlers without this decorator keep following the existing
  * execution path.
  *
+ * Explicitly-read headers (`@Headers()`) form an independent input domain on
+ * annotated handlers: their pipes do run and the transformed value is passed
+ * to the handler, but a header pipe failure aborts parameter resolution
+ * immediately. Its exception is propagated as-is (through the regular
+ * exception filters) and never merged into the aggregated `@Param()`/`@Query()`
+ * messages — any messages collected before the header failure are discarded.
+ *
  * @see [Pipes](https://docs.nestjs.com/pipes)
  *
  * @publicApi

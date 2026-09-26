@@ -10,6 +10,7 @@ import {
   ExceptionFilter,
   ForbiddenException,
   Get,
+  Headers,
   NotFoundException,
   Param,
   PipeTransform,
@@ -117,6 +118,16 @@ class CustomUserPipe implements PipeTransform<any, any> {
       throw new BadRequestException('CUSTOM');
     }
     return user;
+  }
+}
+
+class HeaderTokenPipe implements PipeTransform<string, string> {
+  transform(value: string): string {
+    isolationState.pipeCalls.push('H');
+    if (value !== 'valid') {
+      throw new BadRequestException('H');
+    }
+    return `token:${value}`;
   }
 }
 
@@ -277,5 +288,58 @@ export class AggregateParamErrorsController {
   ) {
     recordHandler('wide');
     return `${id},${limit}`;
+  }
+
+  // Explicitly-read headers form an independent input domain: the header pipe
+  // runs and its transformed value reaches the handler, but a header failure
+  // aborts the resolution immediately and never merges into the aggregated
+  // @Param()/@Query() messages.
+  @AggregateParamErrors()
+  @Get('headers/:id')
+  public withHeaders(
+    @Param('id', new NumberPipe('A')) id: number,
+    @Query('limit', new NumberPipe('B')) limit: number,
+    @Headers('x-token', new HeaderTokenPipe()) token: string,
+  ) {
+    recordHandler('headers');
+    return `${id},${limit},${token}`;
+  }
+
+  // Same input domain behind the method-level filter: on a mixed failure the
+  // filter must observe only the header exception.
+  @AggregateParamErrors()
+  @UseFilters(MyParamFilter)
+  @Get('headers-filtered/:id')
+  public withHeadersFiltered(
+    @Param('id', new NumberPipe('A')) id: number,
+    @Query('limit', new NumberPipe('B')) limit: number,
+    @Headers('x-token', new HeaderTokenPipe()) token: string,
+  ) {
+    recordHandler('headersFiltered');
+    return `${id},${limit},${token}`;
+  }
+
+  // Delayed param pipe so a header failure and a valid request can be
+  // genuinely in flight at the same time in the parallel tests.
+  @AggregateParamErrors()
+  @Get('headers-slow/:id')
+  public withHeadersSlow(
+    @Param('id', new SlowNumberPipe('A', 30)) id: number,
+    @Query('limit', new NumberPipe('B')) limit: number,
+    @Headers('x-token', new HeaderTokenPipe()) token: string,
+  ) {
+    recordHandler('headersSlow');
+    return `${id},${limit},${token}`;
+  }
+
+  // Unannotated counterpart: header parameters keep the existing pipe-less
+  // behavior, so a failing header pipe must not change this route at all.
+  @Get('headers-legacy/:id')
+  public withHeadersLegacy(
+    @Param('id', new NumberPipe('A')) id: number,
+    @Headers('x-token', new HeaderTokenPipe()) token: string,
+  ) {
+    recordHandler('headersLegacy');
+    return `${id},${token}`;
   }
 }

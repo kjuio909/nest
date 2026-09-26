@@ -5,6 +5,7 @@ import {
 import {
   assignMetadata,
   Body,
+  Headers,
   HostParam,
   Param,
   Query,
@@ -1096,6 +1097,91 @@ describe('@Param with ParameterDecoratorOptions', () => {
     }
     const metadata = Reflect.getMetadata(ROUTE_ARGS_METADATA, Test, 'test');
     const key = Object.keys(metadata)[0];
+    expect(metadata[key].data).toBeUndefined();
+    expect(metadata[key].pipes).toHaveLength(1);
+    expect(metadata[key].schema).toBeUndefined();
+  });
+});
+
+describe('@Headers', () => {
+  const mockSchema = {
+    '~standard': {
+      version: 1 as const,
+      vendor: 'test',
+      validate: (v: unknown) => ({ value: v }),
+    },
+  };
+
+  it('should enhance param with no data and no pipes by default', () => {
+    class Test {
+      public test(@Headers() headers) {}
+    }
+    const metadata = Reflect.getMetadata(ROUTE_ARGS_METADATA, Test, 'test');
+    expect(metadata[`${RouteParamtypes.HEADERS}:0`]).toEqual({
+      index: 0,
+      data: undefined,
+      pipes: [],
+    });
+  });
+
+  it('should enhance param with the property name and no pipes', () => {
+    class Test {
+      public test(@Headers('x-token') token) {}
+    }
+    const metadata = Reflect.getMetadata(ROUTE_ARGS_METADATA, Test, 'test');
+    expect(metadata[`${RouteParamtypes.HEADERS}:0`]).toEqual({
+      index: 0,
+      data: 'x-token',
+      pipes: [],
+    });
+  });
+
+  it('should enhance param with pipes passed as trailing arguments', () => {
+    class Test {
+      public test(@Headers('x-token', ParseIntPipe) token) {}
+    }
+    const metadata = Reflect.getMetadata(ROUTE_ARGS_METADATA, Test, 'test');
+    expect(metadata[`${RouteParamtypes.HEADERS}:0`]).toEqual({
+      index: 0,
+      data: 'x-token',
+      pipes: [ParseIntPipe],
+    });
+  });
+
+  it('should enhance param with schema and pipes when options passed as the only argument', () => {
+    class Test {
+      public test(
+        @Headers({ schema: mockSchema, pipes: [ParseIntPipe] }) headers,
+      ) {}
+    }
+    const metadata = Reflect.getMetadata(ROUTE_ARGS_METADATA, Test, 'test');
+    expect(metadata[`${RouteParamtypes.HEADERS}:0`]).toEqual({
+      index: 0,
+      data: undefined,
+      pipes: [ParseIntPipe],
+      schema: mockSchema,
+    });
+  });
+
+  it('should enhance param with schema when options passed as second argument with property', () => {
+    class Test {
+      public test(@Headers('x-token', { schema: mockSchema }) token) {}
+    }
+    const metadata = Reflect.getMetadata(ROUTE_ARGS_METADATA, Test, 'test');
+    expect(metadata[`${RouteParamtypes.HEADERS}:0`]).toEqual({
+      index: 0,
+      data: 'x-token',
+      pipes: [],
+      schema: mockSchema,
+    });
+  });
+
+  it('should not confuse a pipe instance with options', () => {
+    class Test {
+      public test(@Headers(new ParseIntPipe()) headers) {}
+    }
+    const metadata = Reflect.getMetadata(ROUTE_ARGS_METADATA, Test, 'test');
+    const key = `${RouteParamtypes.HEADERS}:0`;
     expect(metadata[key].data).toBeUndefined();
     expect(metadata[key].pipes).toHaveLength(1);
     expect(metadata[key].schema).toBeUndefined();
