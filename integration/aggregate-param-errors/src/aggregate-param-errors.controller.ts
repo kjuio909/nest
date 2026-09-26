@@ -6,6 +6,7 @@ import {
   Controller,
   ExceptionFilter,
   Get,
+  HttpException,
   NotFoundException,
   Param,
   PipeTransform,
@@ -14,10 +15,13 @@ import {
 } from '@nestjs/common';
 import { HttpAdapterHost } from '@nestjs/core';
 
-class NumberPipe implements PipeTransform<string, number> {
+export class NumberPipe implements PipeTransform<string, number> {
+  public static calls: string[] = [];
+
   constructor(private readonly errorMessage: string) {}
 
   transform(value: string): number {
+    NumberPipe.calls.push(this.errorMessage);
     const parsed = Number(value);
     if (Number.isNaN(parsed) || value.trim() === '') {
       throw new BadRequestException(this.errorMessage);
@@ -26,8 +30,11 @@ class NumberPipe implements PipeTransform<string, number> {
   }
 }
 
-class NotFoundPipe implements PipeTransform<string, string> {
+export class NotFoundPipe implements PipeTransform<string, string> {
+  public static calls = 0;
+
   transform(value: string): string {
+    NotFoundPipe.calls++;
     if (value === 'missing') {
       throw new NotFoundException('NOT-FOUND');
     }
@@ -61,14 +68,56 @@ export class MyParamFilter implements ExceptionFilter {
   }
 }
 
+@Catch()
+export class AllExceptionsFilter implements ExceptionFilter {
+  public static received: Array<{ status: number; message: unknown }> = [];
+
+  constructor(private readonly adapterHost: HttpAdapterHost) {}
+
+  catch(exception: unknown, host: ArgumentsHost) {
+    const { httpAdapter } = this.adapterHost;
+    const response = host.switchToHttp().getResponse();
+    const httpException = exception as HttpException;
+    const status =
+      typeof httpException?.getStatus === 'function'
+        ? httpException.getStatus()
+        : 500;
+    const body =
+      typeof httpException?.getResponse === 'function'
+        ? httpException.getResponse()
+        : { message: 'Internal server error' };
+    AllExceptionsFilter.received.push({
+      status,
+      message: (body as { message?: unknown })?.message ?? body,
+    });
+    httpAdapter.reply(response, body, status);
+  }
+}
+
 @Controller('p')
 export class AggregateParamErrorsController {
+  public static handlerCalls: Record<string, number> = {};
+
+  public static reset() {
+    AggregateParamErrorsController.handlerCalls = {};
+    NumberPipe.calls = [];
+    NotFoundPipe.calls = 0;
+    MyParamFilter.received = [];
+    AllExceptionsFilter.received = [];
+  }
+
+  private track(name: string) {
+    AggregateParamErrorsController.handlerCalls[name] =
+      (AggregateParamErrorsController.handlerCalls[name] ?? 0) + 1;
+  }
+
   @AggregateParamErrors()
   @Get(':id')
   public aggregated(
     @Param('id', new NumberPipe('A')) id: number,
     @Query('limit', new NumberPipe('B')) limit: number,
   ) {
+    this.track('aggregated');
     return `${id},${limit}`;
   }
 
@@ -77,6 +126,7 @@ export class AggregateParamErrorsController {
     @Param('id', new NumberPipe('A')) id: number,
     @Query('limit', new NumberPipe('B')) limit: number,
   ) {
+    this.track('legacy');
     return `${id},${limit}`;
   }
 
@@ -87,6 +137,7 @@ export class AggregateParamErrorsController {
     @Param('id', new NumberPipe('A')) id: number,
     @Query('limit', new NumberPipe('B')) limit: number,
   ) {
+    this.track('filtered');
     return `${id},${limit}`;
   }
 
@@ -96,6 +147,18 @@ export class AggregateParamErrorsController {
     @Param('id', new NotFoundPipe()) id: string,
     @Query('limit', new NumberPipe('B')) limit: number,
   ) {
+    this.track('other');
+    return `${id},${limit}`;
+  }
+
+  @AggregateParamErrors()
+  @UseFilters(AllExceptionsFilter)
+  @Get('any/:id')
+  public any(
+    @Param('id', new NotFoundPipe()) id: string,
+    @Query('limit', new NumberPipe('B')) limit: number,
+  ) {
+    this.track('any');
     return `${id},${limit}`;
   }
 }

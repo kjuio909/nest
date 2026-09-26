@@ -575,6 +575,208 @@ describe('RouterExecutionContext', () => {
           'B',
         ]);
       });
+
+      describe('per-request state isolation', () => {
+        // Reuses one pipesFn closure (as a routed handler would) with values
+        // supplied per invocation, proving collected messages and transformed
+        // values never leak between requests.
+        const buildParamFrom = (
+          index: number,
+          type: number,
+          read: () => unknown,
+          paramPipes: PipeTransform[] = [],
+        ) => ({
+          index,
+          type,
+          data: undefined,
+          pipes: paramPipes,
+          extractValue: () => read(),
+        });
+
+        const validatingPipe = (
+          message: string,
+          valid: unknown,
+        ): PipeTransform => ({
+          transform: (value: unknown) => {
+            if (value !== valid) {
+              throw new BadRequestException(message);
+            }
+            return value;
+          },
+        });
+
+        let readPipesFn: ReturnType<typeof contextCreator.createPipesFn>;
+        let scenario: unknown[];
+
+        beforeEach(() => {
+          readPipesFn = contextCreator.createPipesFn(
+            [],
+            [
+              buildParamFrom(
+                0,
+                RouteParamtypes.PARAM,
+                () => scenario[0],
+                [validatingPipe('A', 'ok-A')],
+              ),
+              buildParamFrom(
+                1,
+                RouteParamtypes.QUERY,
+                () => scenario[1],
+                [validatingPipe('B', 'ok-B')],
+              ),
+            ],
+            true,
+          );
+        });
+
+        const catchError = async (
+          run: () => Promise<unknown>,
+        ): Promise<BadRequestException | undefined> => {
+          try {
+            await run();
+          } catch (e) {
+            return e as BadRequestException;
+          }
+          return undefined;
+        };
+
+        it('stays independent between a failing and a succeeding invocation', async () => {
+          scenario = ['bad-A', 'bad-B'];
+          const firstError = await catchError(() =>
+            readPipesFn([undefined, undefined], {}, {}, () => {}),
+          );
+          expect(firstError!).toBeInstanceOf(BadRequestException);
+          expect((firstError!.getResponse() as any).message).toEqual([
+            'A',
+            'B',
+          ]);
+
+          scenario = ['ok-A', 'ok-B'];
+          const secondArgs: unknown[] = [undefined, undefined];
+          await readPipesFn(secondArgs, {}, {}, () => {});
+          expect(secondArgs).toEqual(['ok-A', 'ok-B']);
+        });
+
+        it('stays independent between a succeeding and a failing invocation', async () => {
+          scenario = ['ok-A', 'ok-B'];
+          const firstArgs: unknown[] = [undefined, undefined];
+          await readPipesFn(firstArgs, {}, {}, () => {});
+          expect(firstArgs).toEqual(['ok-A', 'ok-B']);
+
+          scenario = ['bad-A', 'bad-B'];
+          const secondError = await catchError(() =>
+            readPipesFn([undefined, undefined], {}, {}, () => {}),
+          );
+          expect((secondError!.getResponse() as any).message).toEqual([
+            'A',
+            'B',
+          ]);
+        });
+
+        it('never accumulates or duplicates messages across consecutive failures', async () => {
+          for (let i = 0; i < 3; i++) {
+            scenario = ['bad-A', 'bad-B'];
+            const error = await catchError(() =>
+              readPipesFn([undefined, undefined], {}, {}, () => {}),
+            );
+            expect((error!.getResponse() as any).message).toEqual(['A', 'B']);
+          }
+        });
+
+        it('isolates concurrent invocations with different outcomes', async () => {
+          // One shared pipesFn closure, two distinct "requests": extraction
+          // reads from the request object, message collection must be local
+          // to each invocation.
+          const fromReq = (
+            index: number,
+            type: number,
+            key: string,
+            message: string,
+            valid: unknown,
+          ) => ({
+            index,
+            type,
+            data: undefined,
+            pipes: [validatingPipe(message, valid)],
+            extractValue: (req: Record<string, unknown>) => req[key],
+          });
+          const sharedFn = contextCreator.createPipesFn(
+            [],
+            [
+              fromReq(0, RouteParamtypes.PARAM, 'a', 'A', 'ok-A'),
+              fromReq(1, RouteParamtypes.QUERY, 'b', 'B', 'ok-B'),
+            ],
+            true,
+          )!;
+
+          const goodArgs: unknown[] = [undefined, undefined];
+          const badArgs: unknown[] = [undefined, undefined];
+          const goodRequest = { a: 'ok-A', b: 'ok-B' };
+          const badRequest = { a: 'bad-A', b: 'bad-B' };
+
+          const [, badError] = await Promise.all([
+            sharedFn(goodArgs, goodRequest, {}, () => {}),
+            catchError(() =>
+              sharedFn(badArgs, badRequest, {}, () => {}),
+            ),
+          ]);
+
+          expect(goodArgs).toEqual(['ok-A', 'ok-B']);
+          expect(badArgs).toEqual([undefined, undefined]);
+          expect((badError!.getResponse() as any).message).toEqual([
+            'A',
+            'B',
+          ]);
+        });
+
+        it('does not leak collected values after a non-BadRequest failure', async () => {
+          const boomPipe: PipeTransform = {
+            transform: () => {
+              throw new Error('boom');
+            },
+          };
+          const fn = contextCreator.createPipesFn(
+            [],
+            [
+              buildParam(0, RouteParamtypes.PARAM, 'x', [boomPipe]),
+              buildParam(
+                1,
+                RouteParamtypes.QUERY,
+                'ok-B',
+                [validatingPipe('B', 'ok-B')],
+              ),
+            ],
+            true,
+          )!;
+
+          await expect(
+            fn([undefined, undefined], {}, {}, () => {}),
+          ).rejects.toThrow('boom');
+
+          // Reusing the same closure with a healthy request works normally.
+          const nextFn = contextCreator.createPipesFn(
+            [],
+            [
+              buildParam(
+                0,
+                RouteParamtypes.PARAM,
+                'ok-A',
+                [validatingPipe('A', 'ok-A')],
+              ),
+              buildParam(
+                1,
+                RouteParamtypes.QUERY,
+                'ok-B',
+                [validatingPipe('B', 'ok-B')],
+              ),
+            ],
+            true,
+          )!;
+          const nextArgs: unknown[] = [undefined, undefined];
+          await nextFn(nextArgs, {}, {}, () => {});
+          expect(nextArgs).toEqual(['ok-A', 'ok-B']);
+        });
+      });
     });
   });
   describe('reflectAggregateParamErrors', () => {
