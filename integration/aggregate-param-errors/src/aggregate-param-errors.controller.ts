@@ -6,6 +6,7 @@ import {
   Catch,
   Controller,
   createParamDecorator,
+  DefaultValuePipe,
   ExecutionContext,
   ExceptionFilter,
   ForbiddenException,
@@ -76,6 +77,47 @@ class SlowNumberPipe implements PipeTransform<
       throw new BadRequestException(this.errorMessage);
     }
     return parsed;
+  }
+}
+
+// The /defaults route feeds a DefaultValuePipe into this pipe, so the input
+// may already be a number (the default) rather than a raw query string.
+class DefaultedNumberPipe implements PipeTransform<
+  string | number,
+  Promise<number>
+> {
+  constructor(
+    private readonly errorMessage: string,
+    private readonly delayMs = 0,
+  ) {}
+
+  async transform(value: string | number): Promise<number> {
+    isolationState.pipeCalls.push(this.errorMessage);
+    if (this.delayMs > 0) {
+      // Keep genuinely concurrent requests overlapping in the parallel tests.
+      await new Promise(resolve => setTimeout(resolve, this.delayMs));
+    }
+    if (typeof value === 'number') {
+      if (Number.isNaN(value)) {
+        throw new BadRequestException(this.errorMessage);
+      }
+      return value;
+    }
+    const parsed = Number(value);
+    if (Number.isNaN(parsed) || value.trim() === '') {
+      throw new BadRequestException(this.errorMessage);
+    }
+    return parsed;
+  }
+}
+
+class CurrencyPipe implements PipeTransform<string | undefined, string> {
+  transform(value: string | undefined): string {
+    isolationState.pipeCalls.push('CURRENCY');
+    if (value === undefined || !/^[A-Za-z]{3}$/.test(value)) {
+      throw new BadRequestException('CURRENCY');
+    }
+    return value.toUpperCase();
   }
 }
 
@@ -267,6 +309,40 @@ export class AggregateParamErrorsController {
   ) {
     recordHandler('slow');
     return `${id},${limit}`;
+  }
+
+  // The optional `limit` query starts each resolution at 10 when absent and
+  // still goes through the same conversion chain as an explicit value: an
+  // explicit invalid value must surface as LIMIT instead of falling back to
+  // the default, and the missing required `currency` surfaces as CURRENCY.
+  @AggregateParamErrors()
+  @Get('defaults/:id')
+  public defaults(
+    @Param('id', new NumberPipe('A')) id: number,
+    @Query('currency', new CurrencyPipe()) currency: string,
+    @Query('limit', new DefaultValuePipe(10), new DefaultedNumberPipe('LIMIT'))
+    limit: number,
+  ) {
+    recordHandler('defaults');
+    return { id, currency, limit };
+  }
+
+  // Same shape as `defaults`, with delayed conversions so the parallel tests
+  // can keep a defaulted success and an explicit failure genuinely in flight.
+  @AggregateParamErrors()
+  @Get('defaults-slow/:id')
+  public defaultsSlow(
+    @Param('id', new SlowNumberPipe('A', 30)) id: number,
+    @Query('currency', new CurrencyPipe()) currency: string,
+    @Query(
+      'limit',
+      new DefaultValuePipe(10),
+      new DefaultedNumberPipe('LIMIT', 30),
+    )
+    limit: number,
+  ) {
+    recordHandler('defaultsSlow');
+    return { id, currency, limit };
   }
 
   // @Body() must stay outside the aggregation scope: its pipe error aborts

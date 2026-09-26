@@ -122,6 +122,116 @@ export function registerIsolationSuite(deps: IsolationSuiteDeps): void {
       });
     });
 
+    describe('optional query with a default value', () => {
+      it('keeps defaulted success, explicit success, single error, double error and another defaulted success isolated across a sequence', async () => {
+        const defaulted = await request('GET', '/p/defaults/7?currency=usd');
+        expect(defaulted.status).toBe(200);
+        expect(defaulted.body).toEqual({
+          id: 7,
+          currency: 'USD',
+          limit: 10,
+        });
+        expect(isolationState.handlerCalls.defaults).toBe(1);
+        expect(isolationState.pipeCalls).toEqual(['A', 'CURRENCY', 'LIMIT']);
+
+        const explicit = await request(
+          'GET',
+          '/p/defaults/7?currency=usd&limit=3',
+        );
+        expect(explicit.status).toBe(200);
+        expect(explicit.body).toEqual({
+          id: 7,
+          currency: 'USD',
+          limit: 3,
+        });
+
+        const singleError = await request(
+          'GET',
+          '/p/defaults/7?currency=usd&limit=x',
+        );
+        expect(singleError.status).toBe(400);
+        expect(singleError.body.message).toEqual(['LIMIT']);
+        expect(isolationState.handlerCalls.defaults).toBe(2);
+
+        const doubleError = await request('GET', '/p/defaults/7?limit=x');
+        expect(doubleError.status).toBe(400);
+        expect(doubleError.body.message).toEqual(['CURRENCY', 'LIMIT']);
+        expect(isolationState.handlerCalls.defaults).toBe(2);
+
+        const defaultedAgain = await request(
+          'GET',
+          '/p/defaults/7?currency=usd',
+        );
+        expect(defaultedAgain.status).toBe(200);
+        expect(defaultedAgain.body).toEqual({
+          id: 7,
+          currency: 'USD',
+          limit: 10,
+        });
+        expect(isolationState.handlerCalls.defaults).toBe(3);
+
+        // Every request re-ran the whole conversion chain from scratch; the
+        // default value, transformed values and collected error messages were
+        // all scoped to their own request.
+        expect(isolationState.pipeCalls).toEqual([
+          'A',
+          'CURRENCY',
+          'LIMIT',
+          'A',
+          'CURRENCY',
+          'LIMIT',
+          'A',
+          'CURRENCY',
+          'LIMIT',
+          'A',
+          'CURRENCY',
+          'LIMIT',
+          'A',
+          'CURRENCY',
+          'LIMIT',
+        ]);
+      });
+
+      it('does not mask the missing required currency with the defaulted limit and skips the handler', async () => {
+        const missing = await request('GET', '/p/defaults/7');
+        expect(missing.status).toBe(400);
+        expect(missing.body.message).toEqual(['CURRENCY']);
+        expect(isolationState.handlerCalls.defaults ?? 0).toBe(0);
+        // The limit conversion still ran on this request's own default (and
+        // succeeded); the missing currency is reported instead of hidden.
+        expect(isolationState.pipeCalls).toEqual(['A', 'CURRENCY', 'LIMIT']);
+      });
+
+      it('keeps a concurrent defaulted success and an explicit invalid-limit request isolated', async () => {
+        const [defaulted, invalidLimit] = await Promise.all([
+          request('GET', '/p/defaults-slow/7?currency=usd'),
+          request('GET', '/p/defaults-slow/7?currency=usd&limit=x'),
+        ]);
+
+        expect(defaulted.status).toBe(200);
+        expect(defaulted.body).toEqual({
+          id: 7,
+          currency: 'USD',
+          limit: 10,
+        });
+        expect(invalidLimit.status).toBe(400);
+        expect(invalidLimit.body.message).toEqual(['LIMIT']);
+
+        expect(isolationState.handlerCalls.defaultsSlow).toBe(1);
+        // Each request executed its own conversion chain exactly once; the
+        // invalid explicit value never replaced the defaulted request's value.
+        expect(
+          isolationState.pipeCalls.filter(tag => tag === 'A'),
+        ).toHaveLength(2);
+        expect(
+          isolationState.pipeCalls.filter(tag => tag === 'CURRENCY'),
+        ).toHaveLength(2);
+        expect(
+          isolationState.pipeCalls.filter(tag => tag === 'LIMIT'),
+        ).toHaveLength(2);
+      });
+    });
+
     describe('non-BadRequest failure boundary', () => {
       it('aborts immediately with the original error and a following valid request stays clean', async () => {
         const aborted = await request('GET', '/p/partial/abc/abort?limit=x');

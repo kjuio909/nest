@@ -103,6 +103,75 @@ describe('AggregateParamErrors (Express)', () => {
     });
   });
 
+  describe('optional query with a default value (/defaults)', () => {
+    it('uses 10 as the initial limit and converts the currency when limit is absent', () => {
+      return request(server)
+        .get('/p/defaults/7?currency=usd')
+        .expect(200, { id: 7, currency: 'USD', limit: 10 });
+    });
+
+    it('runs an explicit limit through the same conversion chain', () => {
+      return request(server)
+        .get('/p/defaults/7?currency=usd&limit=3')
+        .expect(200, { id: 7, currency: 'USD', limit: 3 });
+    });
+
+    it('does not fall back to the default when the explicit limit is invalid', () => {
+      return request(server)
+        .get('/p/defaults/7?currency=usd&limit=x')
+        .expect(400)
+        .expect({
+          statusCode: 400,
+          error: 'Bad Request',
+          message: ['LIMIT'],
+        });
+    });
+
+    it('reports a single-element CURRENCY array when currency is missing', () => {
+      return request(server)
+        .get('/p/defaults/7')
+        .expect(400)
+        .expect({
+          statusCode: 400,
+          error: 'Bad Request',
+          message: ['CURRENCY'],
+        });
+    });
+
+    it('reports CURRENCY when currency is invalid', () => {
+      return request(server)
+        .get('/p/defaults/7?currency=xx')
+        .expect(400)
+        .expect({
+          statusCode: 400,
+          error: 'Bad Request',
+          message: ['CURRENCY'],
+        });
+    });
+
+    it('aggregates CURRENCY and LIMIT in parameter declaration order and does not mask the missing currency with the default', () => {
+      return request(server)
+        .get('/p/defaults/7?limit=x')
+        .expect(400)
+        .expect({
+          statusCode: 400,
+          error: 'Bad Request',
+          message: ['CURRENCY', 'LIMIT'],
+        });
+    });
+
+    it('keeps the array shape when the path parameter also fails', () => {
+      return request(server)
+        .get('/p/defaults/abc?limit=x')
+        .expect(400)
+        .expect({
+          statusCode: 400,
+          error: 'Bad Request',
+          message: ['A', 'CURRENCY', 'LIMIT'],
+        });
+    });
+  });
+
   describe('when a @Headers() parameter is present', () => {
     it('runs the header pipe and hands all transformed values to the handler', () => {
       return request(server)
