@@ -575,6 +575,202 @@ describe('RouterExecutionContext', () => {
           'B',
         ]);
       });
+
+      // The proxy and the pipes function are created once per route and reused
+      // by every request; only `args` is allocated per call. The aggregation
+      // state must therefore live on the call stack of pipesFn, nowhere else.
+      describe('per-call isolation of a reused pipes function', () => {
+        const countingValidPipe = (
+          tag: string,
+          calls: string[],
+        ): PipeTransform => ({
+          transform: (value: unknown) => {
+            calls.push(tag);
+            const parsed = Number(value);
+            if (Number.isNaN(parsed)) {
+              throw new BadRequestException(tag);
+            }
+            return parsed;
+          },
+        });
+
+        const buildParamWithValue = (
+          index: number,
+          type: number,
+          readValue: () => unknown,
+          paramPipes: PipeTransform[] = [],
+        ) => ({
+          index,
+          type,
+          data: undefined,
+          pipes: paramPipes,
+          extractValue: readValue,
+        });
+
+        it('a valid second call re-runs every pipe and is not tainted by a previous double-error', async () => {
+          const calls: string[] = [];
+          let idValue: unknown = 'abc';
+          let limitValue: unknown = 'x';
+          const pipesFn = contextCreator.createPipesFn(
+            [],
+            [
+              buildParamWithValue(0, RouteParamtypes.PARAM, () => idValue, [
+                countingValidPipe('A', calls),
+              ]),
+              buildParamWithValue(1, RouteParamtypes.QUERY, () => limitValue, [
+                countingValidPipe('B', calls),
+              ]),
+            ],
+            true,
+          )!;
+
+          await expect(
+            pipesFn([undefined, undefined], {}, {}, () => {}),
+          ).rejects.toBeInstanceOf(BadRequestException);
+          expect(calls).toEqual(['A', 'B']);
+
+          // Same pipes function, "second request" with valid inputs.
+          idValue = '7';
+          limitValue = '10';
+          const args: unknown[] = [undefined, undefined];
+          await pipesFn(args, {}, {}, () => {});
+          expect(args).toEqual([7, 10]);
+          expect(calls).toEqual(['A', 'B', 'A', 'B']);
+        });
+
+        it('a double-error after a successful call reports only the new messages', async () => {
+          const calls: string[] = [];
+          let idValue: unknown = '7';
+          let limitValue: unknown = '10';
+          const pipesFn = contextCreator.createPipesFn(
+            [],
+            [
+              buildParamWithValue(0, RouteParamtypes.PARAM, () => idValue, [
+                countingValidPipe('A', calls),
+              ]),
+              buildParamWithValue(1, RouteParamtypes.QUERY, () => limitValue, [
+                countingValidPipe('B', calls),
+              ]),
+            ],
+            true,
+          )!;
+
+          const okArgs: unknown[] = [undefined, undefined];
+          await pipesFn(okArgs, {}, {}, () => {});
+          expect(okArgs).toEqual([7, 10]);
+
+          idValue = 'abc';
+          limitValue = 'x';
+          let error: BadRequestException;
+          try {
+            await pipesFn([undefined, undefined], {}, {}, () => {});
+          } catch (e) {
+            error = e;
+          }
+          expect((error!.getResponse() as any).message).toEqual(['A', 'B']);
+          expect(calls).toEqual(['A', 'B', 'A', 'B']);
+        });
+
+        it('concurrent calls on the same pipes function do not overwrite each other (one valid, one double-error)', async () => {
+          const calls: string[] = [];
+          const slowPipe = (tag: string): PipeTransform => ({
+            transform: async (value: unknown) => {
+              calls.push(tag);
+              await new Promise(resolve => setTimeout(resolve, 10));
+              const parsed = Number(value);
+              if (Number.isNaN(parsed)) {
+                throw new BadRequestException(tag);
+              }
+              return parsed;
+            },
+          });
+          // Extractors read request-scoped values, mirroring the real factory:
+          // one pipes function serves both concurrent "requests".
+          const pipesFn = contextCreator.createPipesFn(
+            [],
+            [
+              buildParamWithValue(
+                0,
+                RouteParamtypes.PARAM,
+                (req: any) => req.id,
+                [slowPipe('A')],
+              ),
+              buildParamWithValue(
+                1,
+                RouteParamtypes.QUERY,
+                (req: any) => req.limit,
+                [slowPipe('B')],
+              ),
+            ],
+            true,
+          )!;
+
+          const okArgs: unknown[] = [undefined, undefined];
+          const [, failure] = await Promise.allSettled([
+            pipesFn(okArgs, { id: '7', limit: '10' }, {}, () => {}),
+            pipesFn(
+              [undefined, undefined],
+              { id: 'abc', limit: 'x' },
+              {},
+              () => {},
+            ),
+          ]);
+
+          expect(okArgs).toEqual([7, 10]);
+          expect(failure.status).toBe('rejected');
+          const error = (failure as PromiseRejectedResult).reason;
+          expect(error).toBeInstanceOf(BadRequestException);
+          expect((error.getResponse() as any).message).toEqual(['A', 'B']);
+          expect(calls.filter(tag => tag === 'A')).toHaveLength(2);
+          expect(calls.filter(tag => tag === 'B')).toHaveLength(2);
+        });
+
+        it('collected messages of an aborted call do not leak into the next call', async () => {
+          const calls: string[] = [];
+          let idValue: unknown = 'abc';
+          let modeValue: unknown = 'abort';
+          let limitValue: unknown = 'x';
+          const abortPipe: PipeTransform = {
+            transform: (value: unknown) => {
+              calls.push('M');
+              if (value === 'abort') {
+                throw new Error('boom');
+              }
+              return value;
+            },
+          };
+          const pipesFn = contextCreator.createPipesFn(
+            [],
+            [
+              buildParamWithValue(0, RouteParamtypes.PARAM, () => idValue, [
+                countingValidPipe('A', calls),
+              ]),
+              buildParamWithValue(1, RouteParamtypes.PARAM, () => modeValue, [
+                abortPipe,
+              ]),
+              buildParamWithValue(2, RouteParamtypes.QUERY, () => limitValue, [
+                countingValidPipe('B', calls),
+              ]),
+            ],
+            true,
+          )!;
+
+          await expect(
+            pipesFn([undefined, undefined, undefined], {}, {}, () => {}),
+          ).rejects.toThrow('boom');
+          expect(calls).toEqual(['A', 'M']);
+
+          idValue = '7';
+          modeValue = 'ok';
+          limitValue = '10';
+          const args: unknown[] = [undefined, undefined, undefined];
+          await pipesFn(args, {}, {}, () => {});
+          expect(args).toEqual([7, 'ok', 10]);
+          // The 'A' collected by the aborted call was discarded; the second
+          // call ran all three pipes from scratch and resolved cleanly.
+          expect(calls).toEqual(['A', 'M', 'A', 'M', 'B']);
+        });
+      });
     });
   });
   describe('reflectAggregateParamErrors', () => {
