@@ -271,4 +271,46 @@ describe('FastifyAdapter', () => {
       await expect(fastifyAdapter.close()).resolves.toBeUndefined();
     });
   });
+
+  describe('closing request gate', () => {
+    const registerRouteAndReady = async () => {
+      fastifyAdapter.get('/test', (_req: unknown, res: FastifyReply) => {
+        res.send('ok');
+      });
+      await fastifyAdapter.getInstance().ready();
+    };
+
+    it('should reject requests that reach the pipeline after the shutdown began', async () => {
+      fastifyAdapter.initHttpServer({ return503OnClosing: true });
+      await registerRouteAndReady();
+
+      fastifyAdapter.beforeClose();
+
+      const res = await fastifyAdapter.inject({ method: 'GET', url: '/test' });
+      expect(res.statusCode).toBe(503);
+      expect(res.body).toBe('Service Unavailable');
+      expect(res.headers['content-type']).toBe('text/plain');
+      expect(res.headers['connection']).toBe('close');
+    });
+
+    it('should not reject requests while the shutdown has not begun', async () => {
+      fastifyAdapter.initHttpServer({ return503OnClosing: true });
+      await registerRouteAndReady();
+
+      const res = await fastifyAdapter.inject({ method: 'GET', url: '/test' });
+      expect(res.statusCode).toBe(200);
+      expect(res.body).toBe('ok');
+    });
+
+    it('should not install the gate when return503OnClosing is not enabled', async () => {
+      fastifyAdapter.initHttpServer({});
+      await registerRouteAndReady();
+
+      fastifyAdapter.beforeClose();
+
+      const res = await fastifyAdapter.inject({ method: 'GET', url: '/test' });
+      expect(res.statusCode).toBe(200);
+      expect(res.body).toBe('ok');
+    });
+  });
 });

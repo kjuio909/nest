@@ -845,17 +845,24 @@ export class FastifyAdapter<
   }
 
   /**
-   * Installs a request gate in front of Fastify's routing so that, once the
-   * shutdown has started, new requests are rejected with
-   * "503 Service Unavailable" before they can enter the Nest pipeline
-   * (middleware, guards, pipes, interceptors, handlers), while requests
-   * that were already accepted run to completion.
+   * Installs a request gate so that, once the shutdown has started, new
+   * requests are rejected with "503 Service Unavailable" before they can
+   * enter the Nest pipeline (middleware, guards, pipes, interceptors,
+   * handlers), while requests that were already accepted run to completion.
    *
-   * The gate wraps the server's "request" listener instead of using a
-   * Fastify "onRequest" hook because Fastify's own "return503OnClosing"
-   * fast path (enabled by default) runs before any hook and answers with a
-   * JSON body, which would not match the Express-compatible contract (a
-   * plain "Service Unavailable" body and a "Connection: close" header).
+   * The gate has two layers:
+   * - a wrapper around the server's "request" listener, which rejects
+   *   requests that arrive after the shutdown state was established -
+   *   including requests pipelined on an existing keep-alive connection.
+   *   Wrapping the listener instead of using a Fastify "onRequest" hook
+   *   keeps Fastify's own "return503OnClosing" fast path (enabled by
+   *   default) from answering first with a JSON body, which would not match
+   *   the Express-compatible contract (a plain "Service Unavailable" body
+   *   and a "Connection: close" header);
+   * - a "preHandler" hook, which rejects requests that arrived before the
+   *   shutdown but have not entered the Nest pipeline yet (e.g. their body
+   *   was still being received when the shutdown began), so they cannot
+   *   produce business side effects either.
    */
   private installClosingRequestGate() {
     const server = this.httpServer as unknown as http.Server;
@@ -866,14 +873,49 @@ export class FastifyAdapter<
         routing(req as unknown as TRawRequest, res as unknown as TRawResponse);
         return;
       }
-      if (req.httpVersionMajor !== 2) {
-        res.setHeader('Connection', 'close');
-      }
-      res.writeHead(HttpStatus.SERVICE_UNAVAILABLE, {
-        'Content-Type': 'text/plain',
-      });
-      res.end('Service Unavailable');
+      this.rejectWithServiceUnavailable(req, res);
     });
+
+    // Second line of defense: a request that passed the listener gate above
+    // before the shutdown state was established, but that has not entered the
+    // Nest pipeline yet (e.g. its body is still being received), must not
+    // produce business side effects either. The "preHandler" hook is the last
+    // lifecycle step before the handler runs, so rejecting here guarantees
+    // that no guard, pipe, interceptor or controller is invoked once the
+    // shutdown has started.
+    this.instance.addHook('preHandler', (request, reply, done) => {
+      if (!this.isShuttingDown) {
+        done();
+        return;
+      }
+      if (request.raw.httpVersionMajor !== 2) {
+        reply.header('Connection', 'close');
+      }
+      // Intentionally not calling "done": sending the reply from a hook
+      // short-circuits the rest of the lifecycle.
+      reply
+        .code(HttpStatus.SERVICE_UNAVAILABLE)
+        .header('Content-Type', 'text/plain')
+        .send('Service Unavailable');
+    });
+  }
+
+  /**
+   * Answers a request with the Express-compatible "503 Service Unavailable"
+   * contract: a plain text body and a "Connection: close" header (except on
+   * HTTP/2, where the header is forbidden).
+   */
+  private rejectWithServiceUnavailable(
+    req: { httpVersionMajor: number },
+    res: http.ServerResponse,
+  ) {
+    if (req.httpVersionMajor !== 2) {
+      res.setHeader('Connection', 'close');
+    }
+    res.writeHead(HttpStatus.SERVICE_UNAVAILABLE, {
+      'Content-Type': 'text/plain',
+    });
+    res.end('Service Unavailable');
   }
 
   private registerJsonContentParser(rawBody?: boolean) {
