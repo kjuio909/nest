@@ -6,6 +6,7 @@ import {
   Catch,
   Controller,
   createParamDecorator,
+  DefaultValuePipe,
   ExecutionContext,
   ExceptionFilter,
   ForbiddenException,
@@ -76,6 +77,55 @@ class SlowNumberPipe implements PipeTransform<
       throw new BadRequestException(this.errorMessage);
     }
     return parsed;
+  }
+}
+
+// The limit chain runs after a DefaultValuePipe, so its input is either the
+// raw query string or the seeded default number. Explicit invalid values must
+// fail the chain (LIMIT) instead of silently falling back to the default.
+class LimitPipe implements PipeTransform<string | number, number> {
+  transform(value: string | number): number {
+    isolationState.pipeCalls.push('LIMIT');
+    if (typeof value === 'string' && value.trim() === '') {
+      throw new BadRequestException('LIMIT');
+    }
+    const parsed = Number(value);
+    if (Number.isNaN(parsed)) {
+      throw new BadRequestException('LIMIT');
+    }
+    return parsed;
+  }
+}
+
+class SlowLimitPipe implements PipeTransform<
+  string | number,
+  Promise<number> | number
+> {
+  constructor(private readonly delayMs: number) {}
+
+  async transform(value: string | number): Promise<number> {
+    isolationState.pipeCalls.push('LIMIT');
+    await new Promise(resolve => setTimeout(resolve, this.delayMs));
+    if (typeof value === 'string' && value.trim() === '') {
+      throw new BadRequestException('LIMIT');
+    }
+    const parsed = Number(value);
+    if (Number.isNaN(parsed)) {
+      throw new BadRequestException('LIMIT');
+    }
+    return parsed;
+  }
+}
+
+// `currency` is a required query parameter: a missing or blank value is a
+// request error (CURRENCY), never masked by the optional `limit` default.
+class CurrencyPipe implements PipeTransform<string | undefined, string> {
+  transform(value: string | undefined): string {
+    isolationState.pipeCalls.push('CURRENCY');
+    if (value === undefined || value.trim() === '') {
+      throw new BadRequestException('CURRENCY');
+    }
+    return value.toUpperCase();
   }
 }
 
@@ -373,5 +423,35 @@ export class AggregateParamErrorsController {
   ) {
     recordHandler('wide');
     return `${id},${limit}`;
+  }
+
+  // Optional query value with a per-resolution default: when `limit` is
+  // absent, DefaultValuePipe seeds 10 which still runs through the same
+  // LimitPipe conversion as an explicit value. An explicit invalid value
+  // must fail (LIMIT), never fall back to 10. `currency` is required.
+  @AggregateParamErrors()
+  @Get('defaults/:id')
+  public defaults(
+    @Param('id', new NumberPipe('A')) id: number,
+    @Query('currency', new CurrencyPipe()) currency: string,
+    @Query('limit', new DefaultValuePipe(10), new LimitPipe())
+    limit: number,
+  ) {
+    recordHandler('defaults');
+    return { id, currency, limit };
+  }
+
+  // Delayed variant of the defaults route used to keep a default-success and
+  // an explicit-invalid request genuinely in flight in the parallel tests.
+  @AggregateParamErrors()
+  @Get('defaults-slow/:id')
+  public defaultsSlow(
+    @Param('id', new SlowNumberPipe('A', 30)) id: number,
+    @Query('currency', new CurrencyPipe()) currency: string,
+    @Query('limit', new DefaultValuePipe(10), new SlowLimitPipe(30))
+    limit: number,
+  ) {
+    recordHandler('defaultsSlow');
+    return { id, currency, limit };
   }
 }

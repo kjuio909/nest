@@ -168,4 +168,97 @@ describe('AggregateParamErrors (Fastify)', () => {
       });
     });
   });
+
+  describe('when an optional @Query() has a default value', () => {
+    it('seeds the default and runs it through the same conversion chain', async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/p/defaults/7?currency=usd',
+      });
+      expect(response.statusCode).toBe(HttpStatus.OK);
+      expect(response.json()).toEqual({
+        id: 7,
+        currency: 'USD',
+        limit: 10,
+      });
+    });
+
+    it('uses the explicit converted value when present', async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/p/defaults/7?currency=usd&limit=3',
+      });
+      expect(response.statusCode).toBe(HttpStatus.OK);
+      expect(response.json()).toEqual({
+        id: 7,
+        currency: 'USD',
+        limit: 3,
+      });
+    });
+
+    it('does not fall back to the default when the explicit value is invalid', async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/p/defaults/7?currency=usd&limit=x',
+      });
+      expect(response.statusCode).toBe(HttpStatus.BAD_REQUEST);
+      expect(response.json()).toEqual({
+        statusCode: 400,
+        error: 'Bad Request',
+        message: ['LIMIT'],
+      });
+    });
+
+    it('reports a missing required currency as a one-element aggregated error', async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/p/defaults/7',
+      });
+      expect(response.statusCode).toBe(HttpStatus.BAD_REQUEST);
+      expect(response.json()).toEqual({
+        statusCode: 400,
+        error: 'Bad Request',
+        message: ['CURRENCY'],
+      });
+    });
+
+    it('reports a blank required currency even when the optional limit defaults', async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/p/defaults/7?currency=',
+      });
+      expect(response.statusCode).toBe(HttpStatus.BAD_REQUEST);
+      expect(response.json()).toEqual({
+        statusCode: 400,
+        error: 'Bad Request',
+        message: ['CURRENCY'],
+      });
+    });
+
+    it('aggregates currency and limit failures in declaration order', async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/p/defaults/7?currency=&limit=x',
+      });
+      expect(response.statusCode).toBe(HttpStatus.BAD_REQUEST);
+      expect(response.json()).toEqual({
+        statusCode: 400,
+        error: 'Bad Request',
+        message: ['CURRENCY', 'LIMIT'],
+      });
+    });
+
+    it('aggregates param, currency and limit failures in declaration order', async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/p/defaults/abc?currency=&limit=x',
+      });
+      expect(response.statusCode).toBe(HttpStatus.BAD_REQUEST);
+      expect(response.json()).toEqual({
+        statusCode: 400,
+        error: 'Bad Request',
+        message: ['A', 'CURRENCY', 'LIMIT'],
+      });
+    });
+  });
 });

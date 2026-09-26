@@ -135,4 +135,73 @@ describe('AggregateParamErrors (Express)', () => {
         });
     });
   });
+
+  describe('when an optional @Query() has a default value', () => {
+    it('seeds the default and runs it through the same conversion chain', () => {
+      return request(server)
+        .get('/p/defaults/7?currency=usd')
+        .expect(200, { id: 7, currency: 'USD', limit: 10 });
+    });
+
+    it('uses the explicit converted value when present', () => {
+      return request(server)
+        .get('/p/defaults/7?currency=usd&limit=3')
+        .expect(200, { id: 7, currency: 'USD', limit: 3 });
+    });
+
+    it('does not fall back to the default when the explicit value is invalid', () => {
+      return request(server)
+        .get('/p/defaults/7?currency=usd&limit=x')
+        .expect(400)
+        .expect({
+          statusCode: 400,
+          error: 'Bad Request',
+          message: ['LIMIT'],
+        });
+    });
+
+    it('reports a missing required currency as a one-element aggregated error', () => {
+      return request(server)
+        .get('/p/defaults/7')
+        .expect(400)
+        .expect({
+          statusCode: 400,
+          error: 'Bad Request',
+          message: ['CURRENCY'],
+        });
+    });
+
+    it('reports a blank required currency even when the optional limit defaults', () => {
+      return request(server)
+        .get('/p/defaults/7?currency=')
+        .expect(400)
+        .expect({
+          statusCode: 400,
+          error: 'Bad Request',
+          message: ['CURRENCY'],
+        });
+    });
+
+    it('aggregates currency and limit failures in declaration order', () => {
+      return request(server)
+        .get('/p/defaults/7?currency=&limit=x')
+        .expect(400)
+        .expect({
+          statusCode: 400,
+          error: 'Bad Request',
+          message: ['CURRENCY', 'LIMIT'],
+        });
+    });
+
+    it('aggregates param, currency and limit failures in declaration order', () => {
+      return request(server)
+        .get('/p/defaults/abc?currency=&limit=x')
+        .expect(400)
+        .expect({
+          statusCode: 400,
+          error: 'Bad Request',
+          message: ['A', 'CURRENCY', 'LIMIT'],
+        });
+    });
+  });
 });
