@@ -323,6 +323,7 @@ describe('RouterExecutionContext', () => {
         expect(contextCreator.isPipeable(RouteParamtypes.RAW_BODY)).toBe(true);
         expect(contextCreator.isPipeable(RouteParamtypes.QUERY)).toBe(true);
         expect(contextCreator.isPipeable(RouteParamtypes.PARAM)).toBe(true);
+        expect(contextCreator.isPipeable(RouteParamtypes.HEADERS)).toBe(true);
         expect(contextCreator.isPipeable(RouteParamtypes.FILE)).toBe(true);
         expect(contextCreator.isPipeable(RouteParamtypes.FILES)).toBe(true);
         expect(contextCreator.isPipeable('custom')).toBe(true);
@@ -378,6 +379,41 @@ describe('RouterExecutionContext', () => {
           error: 'Bad Request',
           message: expect.stringMatching(/A|B/),
         });
+      });
+
+      it('still runs @Headers() pipes and fails fast on a header error', async () => {
+        const okHeaderPipe: PipeTransform = {
+          transform: (value: unknown) => `${value}-transformed`,
+        };
+        const pipesFn = contextCreator.createPipesFn(
+          [],
+          [
+            buildParam(0, RouteParamtypes.PARAM, '7'),
+            buildParam(1, RouteParamtypes.HEADERS, 'ok', [okHeaderPipe]),
+            buildParam(2, RouteParamtypes.QUERY, '10'),
+          ],
+        )!;
+
+        const args: unknown[] = [undefined, undefined, undefined];
+        await pipesFn(args, {}, {}, () => {});
+        expect(args).toEqual(['7', 'ok-transformed', '10']);
+
+        const failing = contextCreator.createPipesFn(
+          [],
+          [
+            buildParam(0, RouteParamtypes.HEADERS, 'bad', [throwingPipe('H')]),
+            buildParam(1, RouteParamtypes.QUERY, 'x', [throwingPipe('B')]),
+          ],
+        )!;
+
+        let error: BadRequestException;
+        try {
+          await failing([undefined, undefined], {}, {}, () => {});
+        } catch (e) {
+          error = e;
+        }
+        expect(error!).toBeInstanceOf(BadRequestException);
+        expect((error!.getResponse() as any).message).toBe('H');
       });
     });
 
@@ -574,6 +610,140 @@ describe('RouterExecutionContext', () => {
           'two',
           'B',
         ]);
+      });
+
+      // @Headers() parameters are an independent input domain: their pipes
+      // always run and the transformed values reach the handler, but their
+      // errors are never merged into the @Param()/@Query() message collection.
+      describe('@Headers() parameters', () => {
+        const headerPipe = (tag = 'H'): PipeTransform => ({
+          transform: (value: unknown) => {
+            if (value !== 'ok') {
+              throw new BadRequestException(tag);
+            }
+            return `${value}-transformed`;
+          },
+        });
+
+        it('runs the header pipe and hands all three transformed values to the handler', async () => {
+          const pipesFn = contextCreator.createPipesFn(
+            [],
+            [
+              buildParam(0, RouteParamtypes.PARAM, '7'),
+              buildParam(1, RouteParamtypes.HEADERS, 'ok', [headerPipe()]),
+              buildParam(2, RouteParamtypes.QUERY, '10'),
+            ],
+            true,
+          )!;
+          const args: unknown[] = [undefined, undefined, undefined];
+          await pipesFn(args, {}, {}, () => {});
+
+          expect(args).toEqual(['7', 'ok-transformed', '10']);
+        });
+
+        it('propagates the header exception and discards the messages collected so far', async () => {
+          const pipesFn = contextCreator.createPipesFn(
+            [],
+            [
+              buildParam(0, RouteParamtypes.PARAM, 'abc', [throwingPipe('A')]),
+              buildParam(1, RouteParamtypes.HEADERS, 'bad', [headerPipe()]),
+              buildParam(2, RouteParamtypes.QUERY, 'x', [throwingPipe('B')]),
+            ],
+            true,
+          )!;
+
+          let error: BadRequestException;
+          try {
+            await pipesFn([undefined, undefined, undefined], {}, {}, () => {});
+          } catch (e) {
+            error = e;
+          }
+          // Only the header exception is observable: the collected 'A' message
+          // must not leak into the response, and the 'B' pipe never ran.
+          expect(error!).toBeInstanceOf(BadRequestException);
+          expect(error!.getResponse()).toEqual({
+            statusCode: HttpStatus.BAD_REQUEST,
+            error: 'Bad Request',
+            message: 'H',
+          });
+        });
+
+        it('aborts immediately on a header failure declared before the aggregated parameters', async () => {
+          const calls: string[] = [];
+          const trackingPipe = (tag: string): PipeTransform => ({
+            transform: () => {
+              calls.push(tag);
+              throw new BadRequestException(tag);
+            },
+          });
+          const pipesFn = contextCreator.createPipesFn(
+            [],
+            [
+              buildParam(0, RouteParamtypes.HEADERS, 'bad', [headerPipe()]),
+              buildParam(1, RouteParamtypes.PARAM, 'abc', [trackingPipe('A')]),
+              buildParam(2, RouteParamtypes.QUERY, 'x', [trackingPipe('B')]),
+            ],
+            true,
+          )!;
+
+          let error: BadRequestException;
+          try {
+            await pipesFn([undefined, undefined, undefined], {}, {}, () => {});
+          } catch (e) {
+            error = e;
+          }
+          expect(error!).toBeInstanceOf(BadRequestException);
+          expect(error!.getResponse()).toEqual({
+            statusCode: HttpStatus.BAD_REQUEST,
+            error: 'Bad Request',
+            message: 'H',
+          });
+          expect(calls).toEqual([]);
+        });
+
+        it('does not aggregate non-BadRequest header exceptions either', async () => {
+          const forbiddenHeaderPipe: PipeTransform = {
+            transform: () => {
+              throw new ForbiddenException('NO-HEADER');
+            },
+          };
+          const pipesFn = contextCreator.createPipesFn(
+            [],
+            [
+              buildParam(0, RouteParamtypes.PARAM, 'abc', [throwingPipe('A')]),
+              buildParam(1, RouteParamtypes.HEADERS, 'bad', [
+                forbiddenHeaderPipe,
+              ]),
+            ],
+            true,
+          )!;
+
+          await expect(
+            pipesFn([undefined, undefined], {}, {}, () => {}),
+          ).rejects.toMatchObject({
+            status: HttpStatus.FORBIDDEN,
+          });
+        });
+
+        it('keeps the aggregated collection untouched when the header pipe succeeds', async () => {
+          const pipesFn = contextCreator.createPipesFn(
+            [],
+            [
+              buildParam(0, RouteParamtypes.PARAM, 'abc', [throwingPipe('A')]),
+              buildParam(1, RouteParamtypes.HEADERS, 'ok', [headerPipe()]),
+              buildParam(2, RouteParamtypes.QUERY, 'x', [throwingPipe('B')]),
+            ],
+            true,
+          )!;
+
+          let error: BadRequestException;
+          try {
+            await pipesFn([undefined, undefined, undefined], {}, {}, () => {});
+          } catch (e) {
+            error = e;
+          }
+          expect((error!.getResponse() as any).message).toEqual(['A', 'B']);
+        });
       });
 
       // The proxy and the pipes function are created once per route and reused

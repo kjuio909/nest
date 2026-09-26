@@ -128,4 +128,44 @@ describe('AggregateParamErrors (Fastify)', () => {
       });
     });
   });
+
+  describe('when a @Headers() parameter is present', () => {
+    it('runs the header pipe and hands all transformed values to the handler', async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/p/headers/7?limit=10',
+        headers: { 'x-token': '5' },
+      });
+      expect(response.statusCode).toBe(HttpStatus.OK);
+      expect(response.payload).toBe('7,5,10');
+    });
+
+    it('responds with only the aggregated messages when the header is valid', async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/p/headers/abc?limit=x',
+        headers: { 'x-token': '5' },
+      });
+      expect(response.statusCode).toBe(HttpStatus.BAD_REQUEST);
+      expect(response.json()).toEqual({
+        statusCode: 400,
+        error: 'Bad Request',
+        message: ['A', 'B'],
+      });
+    });
+
+    it('aborts with only the header exception on a mixed failure', async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/p/headers/abc?limit=x',
+        headers: { 'x-token': 'bad' },
+      });
+      expect(response.statusCode).toBe(HttpStatus.BAD_REQUEST);
+      expect(response.json()).toEqual({
+        statusCode: 400,
+        error: 'Bad Request',
+        message: 'H',
+      });
+    });
+  });
 });

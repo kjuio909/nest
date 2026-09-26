@@ -365,8 +365,122 @@ export function UploadedFiles(
  *
  * @publicApi
  */
-export const Headers: (property?: string) => ParameterDecorator =
-  createRouteParamDecorator(RouteParamtypes.HEADERS);
+export function Headers(): ParameterDecorator;
+/**
+ * Route handler parameter decorator. Extracts the `headers`
+ * property from the `req` object and populates the decorated
+ * parameter with the value of `headers`. May also apply pipes to the bound
+ * headers parameter.
+ *
+ * For example: `async update(@Headers(new ValidationPipe()) headers)`
+ *
+ * @param pipes one or more pipes to apply to the bound headers parameter
+ *
+ * @see [Request object](https://docs.nestjs.com/controllers#request-object)
+ *
+ * @publicApi
+ */
+export function Headers(
+  ...pipes: (Type<PipeTransform> | PipeTransform)[]
+): ParameterDecorator;
+/**
+ * Route handler parameter decorator. Extracts the `headers`
+ * property from the `req` object and populates the decorated
+ * parameter with the value of `headers`. May also apply pipes to the bound
+ * header parameter.
+ *
+ * For example: `async update(@Headers('x-token', new ParseIntPipe()) token: number)`
+ *
+ * @param property name of single header property to extract.
+ * @param pipes one or more pipes to apply to the bound header parameter
+ *
+ * @see [Request object](https://docs.nestjs.com/controllers#request-object)
+ *
+ * @publicApi
+ */
+export function Headers(
+  property: string,
+  ...pipes: (Type<PipeTransform> | PipeTransform)[]
+): ParameterDecorator;
+/**
+ * Route handler parameter decorator. Extracts the `headers`
+ * property from the `req` object and populates the decorated
+ * parameter with the value of `headers`. May also apply pipes to the bound
+ * header parameter.
+ *
+ * @param property name of single header property to extract.
+ * @param options options object containing additional configuration for the decorator, such as pipes and schema
+ *
+ * @see [Request object](https://docs.nestjs.com/controllers#request-object)
+ *
+ * @publicApi
+ */
+export function Headers(
+  property: string,
+  options: ParameterDecoratorOptions,
+): ParameterDecorator;
+/**
+ * Route handler parameter decorator. Extracts the `headers`
+ * property from the `req` object and populates the decorated
+ * parameter with the value of `headers`. May also apply pipes to the bound
+ * headers parameter.
+ *
+ * @param options options object containing additional configuration for the decorator, such as pipes and schema
+ *
+ * @see [Request object](https://docs.nestjs.com/controllers#request-object)
+ *
+ * @publicApi
+ */
+export function Headers(options: ParameterDecoratorOptions): ParameterDecorator;
+/**
+ * Route handler parameter decorator. Extracts the `headers`
+ * property from the `req` object and populates the decorated
+ * parameter with the value of `headers`. May also apply pipes to the bound
+ * header parameter.
+ *
+ * For example: `async update(@Headers('x-token', new ParseIntPipe()) token: number)`
+ *
+ * @param property name of single header property to extract.
+ * @param optionsOrPipe one or more pipes to apply to the bound header parameter or options object
+ * @param pipes one or more pipes to apply to the bound header parameter
+ *
+ * @see [Request object](https://docs.nestjs.com/controllers#request-object)
+ *
+ * @publicApi
+ */
+export function Headers(
+  property?:
+    | string
+    | (Type<PipeTransform> | PipeTransform)
+    | ParameterDecoratorOptions,
+  optionsOrPipe?:
+    | ParameterDecoratorOptions
+    | Type<PipeTransform>
+    | PipeTransform,
+  ...pipes: (Type<PipeTransform> | PipeTransform)[]
+): ParameterDecorator {
+  const isPropertyOptions = isParameterDecoratorOptions(property);
+
+  if (isPropertyOptions) {
+    return createPipesRouteParamDecorator(RouteParamtypes.HEADERS)({
+      pipes: property.pipes,
+      schema: property.schema,
+    });
+  }
+
+  const isOptions = isParameterDecoratorOptions(optionsOrPipe);
+  const actualPipes = isOptions
+    ? [...(optionsOrPipe.pipes ?? []), ...pipes]
+    : ([optionsOrPipe, ...pipes].filter(Boolean) as (
+        | Type<PipeTransform>
+        | PipeTransform
+      )[]);
+  return createPipesRouteParamDecorator(RouteParamtypes.HEADERS)({
+    data: property,
+    pipes: actualPipes,
+    schema: isOptions ? optionsOrPipe.schema : undefined,
+  });
+}
 
 /**
  * Route handler parameter decorator. Extracts the `query`

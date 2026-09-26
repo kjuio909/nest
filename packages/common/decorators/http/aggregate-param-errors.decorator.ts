@@ -12,6 +12,13 @@ import { AGGREGATE_PARAM_ERRORS_METADATA } from '../../constants.js';
  * position). With a single error the response has the same shape as the
  * default validation error (`message` is a one-element array).
  *
+ * Pipes bound to `@Headers()` parameters always run (their transformed
+ * values are passed to the handler alongside the `@Param()`/`@Query()`
+ * values), but they form an independent input domain: a header pipe failure
+ * aborts the parameter resolution immediately, any `@Param()`/`@Query()`
+ * messages collected so far are discarded, and exception filters only
+ * observe the header exception.
+ *
  * Pipes bound to other parameter decorators (`@Body()`, custom decorators,
  * ...) and handlers without this decorator keep following the existing
  * execution path.

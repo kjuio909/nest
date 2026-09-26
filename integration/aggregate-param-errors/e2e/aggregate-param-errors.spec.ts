@@ -102,4 +102,37 @@ describe('AggregateParamErrors (Express)', () => {
         });
     });
   });
+
+  describe('when a @Headers() parameter is present', () => {
+    it('runs the header pipe and hands all transformed values to the handler', () => {
+      return request(server)
+        .get('/p/headers/7?limit=10')
+        .set('x-token', '5')
+        .expect(200, '7,5,10');
+    });
+
+    it('responds with only the aggregated messages when the header is valid', () => {
+      return request(server)
+        .get('/p/headers/abc?limit=x')
+        .set('x-token', '5')
+        .expect(400)
+        .expect({
+          statusCode: 400,
+          error: 'Bad Request',
+          message: ['A', 'B'],
+        });
+    });
+
+    it('aborts with only the header exception on a mixed failure', () => {
+      return request(server)
+        .get('/p/headers/abc?limit=x')
+        .set('x-token', 'bad')
+        .expect(400)
+        .expect({
+          statusCode: 400,
+          error: 'Bad Request',
+          message: 'H',
+        });
+    });
+  });
 });

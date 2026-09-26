@@ -10,6 +10,7 @@ import {
   ExceptionFilter,
   ForbiddenException,
   Get,
+  Headers,
   NotFoundException,
   Param,
   PipeTransform,
@@ -117,6 +118,33 @@ class CustomUserPipe implements PipeTransform<any, any> {
       throw new BadRequestException('CUSTOM');
     }
     return user;
+  }
+}
+
+class HeaderNumberPipe implements PipeTransform<string | undefined, number> {
+  transform(value: string | undefined): number {
+    isolationState.pipeCalls.push('H');
+    const parsed = Number(value);
+    if (
+      value === undefined ||
+      String(value).trim() === '' ||
+      Number.isNaN(parsed)
+    ) {
+      throw new BadRequestException('H');
+    }
+    return parsed;
+  }
+}
+
+class HeaderAbortPipe implements PipeTransform<string | undefined, string> {
+  transform(value: string | undefined): string {
+    isolationState.pipeCalls.push('HF');
+    if (value === 'abort') {
+      // A non-BadRequest exception raised by a header pipe: aggregation must
+      // abort immediately and the staged param/query messages are discarded.
+      throw new ForbiddenException('HEADER-ABORT');
+    }
+    return value ?? '';
   }
 }
 
@@ -264,6 +292,74 @@ export class AggregateParamErrorsController {
   ) {
     recordHandler('custom');
     return `${id},${limit},${user.name}`;
+  }
+
+  // @Headers() parameters are an independent input domain: the header pipe
+  // always runs and its transformed value reaches the handler, but a header
+  // failure aborts the resolution immediately and discards any @Param()/
+  // @Query() messages collected so far.
+  @AggregateParamErrors()
+  @Get('headers/:id')
+  public withHeaders(
+    @Param('id', new NumberPipe('A')) id: number,
+    @Headers('x-token', new HeaderNumberPipe()) token: number,
+    @Query('limit', new NumberPipe('B')) limit: number,
+  ) {
+    recordHandler('headers');
+    return `${id},${token},${limit}`;
+  }
+
+  // The filter must observe only the header exception when the header pipe
+  // fails - never the staged @Param()/@Query() messages.
+  @AggregateParamErrors()
+  @UseFilters(MyParamFilter)
+  @Get('headers-filtered/:id')
+  public withHeadersFiltered(
+    @Param('id', new NumberPipe('A')) id: number,
+    @Headers('x-token', new HeaderNumberPipe()) token: number,
+    @Query('limit', new NumberPipe('B')) limit: number,
+  ) {
+    recordHandler('headersFiltered');
+    return `${id},${token},${limit}`;
+  }
+
+  // A non-BadRequest header exception propagates unchanged through the
+  // catch-all filter; the staged param/query messages die with the request.
+  @AggregateParamErrors()
+  @UseFilters(MyWideFilter)
+  @Get('headers-wide/:id')
+  public withHeadersWide(
+    @Param('id', new NumberPipe('A')) id: number,
+    @Headers('x-mode', new HeaderAbortPipe()) mode: string,
+    @Query('limit', new NumberPipe('B')) limit: number,
+  ) {
+    recordHandler('headersWide');
+    return `${id},${mode},${limit}`;
+  }
+
+  // Unannotated route with a header pipe: the header pipe runs, but the
+  // fail-fast compatibility path is unchanged.
+  @Get('headers-legacy/:id')
+  public withHeadersLegacy(
+    @Param('id', new NumberPipe('A')) id: number,
+    @Headers('x-token', new HeaderNumberPipe()) token: number,
+    @Query('limit', new NumberPipe('B')) limit: number,
+  ) {
+    recordHandler('headersLegacy');
+    return `${id},${token},${limit}`;
+  }
+
+  // Delayed pipes on all three domains, used to keep mixed-failure requests
+  // genuinely in flight at the same time in the parallel tests.
+  @AggregateParamErrors()
+  @Get('headers-slow/:id')
+  public withHeadersSlow(
+    @Param('id', new SlowNumberPipe('A', 30)) id: number,
+    @Headers('x-token', new SlowNumberPipe('H', 30)) token: number,
+    @Query('limit', new SlowNumberPipe('B', 30)) limit: number,
+  ) {
+    recordHandler('headersSlow');
+    return `${id},${token},${limit}`;
   }
 
   // A catch-all method filter must receive the original non-request exception

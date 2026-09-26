@@ -212,6 +212,153 @@ export function registerIsolationSuite(deps: IsolationSuiteDeps): void {
       });
     });
 
+    describe('@Headers() independent input domain', () => {
+      it('runs the header pipe and calls the handler once with all three transformed values', async () => {
+        const ok = await request('GET', '/p/headers/7?limit=10', {
+          headers: { 'x-token': '5' },
+        });
+        expect(ok.status).toBe(200);
+        expect(ok.text).toBe('7,5,10');
+        expect(isolationState.pipeCalls).toEqual(['A', 'H', 'B']);
+        expect(isolationState.handlerCalls.headers).toBe(1);
+      });
+
+      it('responds with only the aggregated param/query messages when the header is valid', async () => {
+        const failed = await request('GET', '/p/headers/abc?limit=x', {
+          headers: { 'x-token': '5' },
+        });
+        expect(failed.status).toBe(400);
+        expect(failed.body).toEqual({
+          statusCode: 400,
+          error: 'Bad Request',
+          message: ['A', 'B'],
+        });
+        expect(isolationState.handlerCalls.headers ?? 0).toBe(0);
+        expect(isolationState.pipeCalls).toEqual(['A', 'H', 'B']);
+      });
+
+      it('aborts immediately on a header failure: staged param messages are discarded and later pipes never run', async () => {
+        const failed = await request('GET', '/p/headers/abc?limit=x', {
+          headers: { 'x-token': 'bad' },
+        });
+        expect(failed.status).toBe(400);
+        expect(failed.body).toEqual({
+          statusCode: 400,
+          error: 'Bad Request',
+          message: 'H',
+        });
+        expect(isolationState.handlerCalls.headers ?? 0).toBe(0);
+        // 'A' ran and was collected, the header aborted the resolution, so
+        // the trailing @Query() pipe never ran.
+        expect(isolationState.pipeCalls).toEqual(['A', 'H']);
+      });
+
+      it('a valid request after a mixed failure observes no leftover state', async () => {
+        const mixed = await request('GET', '/p/headers/abc?limit=x', {
+          headers: { 'x-token': 'bad' },
+        });
+        expect(mixed.body.message).toBe('H');
+
+        const ok = await request('GET', '/p/headers/7?limit=10', {
+          headers: { 'x-token': '5' },
+        });
+        expect(ok.status).toBe(200);
+        expect(ok.text).toBe('7,5,10');
+        expect(isolationState.pipeCalls).toEqual(['A', 'H', 'A', 'H', 'B']);
+        expect(isolationState.handlerCalls.headers).toBe(1);
+      });
+
+      it('the exception filter observes only the header exception on a mixed failure', async () => {
+        const failed = await request('GET', '/p/headers-filtered/abc?limit=x', {
+          headers: { 'x-token': 'bad' },
+        });
+        expect(failed.status).toBe(422);
+        expect(failed.body).toEqual({ code: 'PARAMS_INVALID', count: 1 });
+        expect(MyParamFilter.received).toHaveLength(1);
+        expect(MyParamFilter.received[0]).toEqual({
+          status: 400,
+          message: 'H',
+        });
+        expect(isolationState.handlerCalls.headersFiltered ?? 0).toBe(0);
+      });
+
+      it('the filter still receives the single aggregated exception when only params fail', async () => {
+        const failed = await request('GET', '/p/headers-filtered/abc?limit=x', {
+          headers: { 'x-token': '5' },
+        });
+        expect(failed.status).toBe(422);
+        expect(failed.body).toEqual({ code: 'PARAMS_INVALID', count: 2 });
+        expect(MyParamFilter.received).toHaveLength(1);
+        expect(MyParamFilter.received[0]).toEqual({
+          status: 400,
+          message: ['A', 'B'],
+        });
+      });
+
+      it('propagates a non-BadRequest header exception unchanged and discards staged messages', async () => {
+        const failed = await request('GET', '/p/headers-wide/abc?limit=x', {
+          headers: { 'x-mode': 'abort' },
+        });
+        expect(failed.status).toBe(418);
+        expect(failed.body).toEqual({ code: 'WIDE' });
+        expect(MyWideFilter.last).toEqual({
+          name: 'ForbiddenException',
+          status: 403,
+        });
+        expect(isolationState.handlerCalls.headersWide ?? 0).toBe(0);
+        expect(isolationState.pipeCalls).toEqual(['A', 'HF']);
+      });
+
+      it('runs header pipes on unannotated routes without changing the fail-fast path', async () => {
+        const failed = await request('GET', '/p/headers-legacy/7?limit=10', {
+          headers: { 'x-token': 'bad' },
+        });
+        expect(failed.status).toBe(400);
+        expect(failed.body.message).toBe('H');
+        expect(isolationState.handlerCalls.headersLegacy ?? 0).toBe(0);
+
+        const ok = await request('GET', '/p/headers-legacy/7?limit=10', {
+          headers: { 'x-token': '5' },
+        });
+        expect(ok.status).toBe(200);
+        expect(ok.text).toBe('7,5,10');
+        expect(isolationState.handlerCalls.headersLegacy).toBe(1);
+      });
+
+      it('keeps consecutive success, double-error, header-failure and mixed-failure responses isolated', async () => {
+        const ok = await request('GET', '/p/headers/7?limit=10', {
+          headers: { 'x-token': '5' },
+        });
+        expect(ok.status).toBe(200);
+        expect(ok.text).toBe('7,5,10');
+
+        const doubleError = await request('GET', '/p/headers/abc?limit=x', {
+          headers: { 'x-token': '5' },
+        });
+        expect(doubleError.body.message).toEqual(['A', 'B']);
+
+        const headerOnly = await request('GET', '/p/headers/7?limit=10', {
+          headers: { 'x-token': 'bad' },
+        });
+        expect(headerOnly.body.message).toBe('H');
+
+        const mixed = await request('GET', '/p/headers/abc?limit=x', {
+          headers: { 'x-token': 'bad' },
+        });
+        expect(mixed.body.message).toBe('H');
+
+        expect(isolationState.handlerCalls.headers).toBe(1);
+        // The header failures stopped at 'H' (the trailing @Query() pipe never
+        // ran); no response carried messages collected by another response.
+        expect(isolationState.pipeCalls).toEqual([
+          'A', 'H', 'B',
+          'A', 'H', 'B',
+          'A', 'H',
+          'A', 'H',
+        ]);
+      });
+    });
+
     describe('parallel requests', () => {
       it('keeps a concurrent valid and double-error request isolated regardless of completion order', async () => {
         const [valid, invalid] = await Promise.all([
@@ -236,6 +383,59 @@ export function registerIsolationSuite(deps: IsolationSuiteDeps): void {
           isolationState.pipeCalls.filter(tag => tag === 'B'),
         ).toHaveLength(2);
         expect(isolationState.handlerCalls.slow).toBe(1);
+      });
+
+      it('keeps a concurrent valid and header-failure request isolated', async () => {
+        const [valid, headerFailure] = await Promise.all([
+          request('GET', '/p/headers-slow/7?limit=10', {
+            headers: { 'x-token': '5' },
+          }),
+          request('GET', '/p/headers-slow/7?limit=10', {
+            headers: { 'x-token': 'bad' },
+          }),
+        ]);
+
+        expect(valid.status).toBe(200);
+        expect(valid.text).toBe('7,5,10');
+        expect(headerFailure.status).toBe(400);
+        expect(headerFailure.body.message).toBe('H');
+
+        expect(isolationState.handlerCalls.headersSlow).toBe(1);
+        // The failing request aborted at 'H' and never ran its query pipe;
+        // the transformed token only ever reached the successful handler.
+        expect(isolationState.pipeCalls.filter(t => t === 'A')).toHaveLength(2);
+        expect(isolationState.pipeCalls.filter(t => t === 'H')).toHaveLength(2);
+        expect(isolationState.pipeCalls.filter(t => t === 'B')).toHaveLength(1);
+      });
+
+      it('keeps a concurrent double-error and header-failure (mixed) request isolated', async () => {
+        const [doubleError, mixed] = await Promise.all([
+          request('GET', '/p/headers-slow/abc?limit=x', {
+            headers: { 'x-token': '5' },
+          }),
+          request('GET', '/p/headers-slow/abc?limit=x', {
+            headers: { 'x-token': 'bad' },
+          }),
+        ]);
+
+        expect(doubleError.status).toBe(400);
+        expect(doubleError.body.message).toEqual(['A', 'B']);
+        expect(mixed.status).toBe(400);
+        expect(mixed.body.message).toBe('H');
+
+        expect(isolationState.handlerCalls.headersSlow ?? 0).toBe(0);
+        // Both requests collected an 'A'; only the double-error request
+        // reached its @Query() pipe. The mixed request discarded its staged
+        // 'A' instead of leaking it into the double-error response.
+        expect(
+          isolationState.pipeCalls.filter(tag => tag === 'A'),
+        ).toHaveLength(2);
+        expect(
+          isolationState.pipeCalls.filter(tag => tag === 'H'),
+        ).toHaveLength(2);
+        expect(
+          isolationState.pipeCalls.filter(tag => tag === 'B'),
+        ).toHaveLength(1);
       });
     });
 

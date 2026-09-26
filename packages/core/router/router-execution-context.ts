@@ -382,6 +382,7 @@ export class RouterExecutionContext {
       type === RouteParamtypes.RAW_BODY ||
       type === RouteParamtypes.QUERY ||
       type === RouteParamtypes.PARAM ||
+      type === RouteParamtypes.HEADERS ||
       type === RouteParamtypes.FILE ||
       type === RouteParamtypes.FILES ||
       isString(type)
@@ -464,6 +465,13 @@ export class RouterExecutionContext {
       // order, and their rejections are collected and rethrown as a single
       // BadRequestException. Pipes bound to any other parameter keep the
       // existing fail-fast path (their errors propagate immediately).
+      //
+      // @Headers() parameters form an independent input domain: their pipes
+      // always run and the transformed values are handed to the handler, but
+      // a header pipe failure aborts the resolution immediately. The header
+      // exception is never merged into the collected @Param()/@Query()
+      // messages - any messages collected so far are discarded with this
+      // request, so exception filters only observe the header exception.
       const orderedParams = [...paramsOptions].sort(
         (a, b) => a.index - b.index,
       );
