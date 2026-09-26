@@ -7,6 +7,7 @@ import {
   VersioningType,
 } from '@nestjs/common';
 import { FastifyReply, FastifyRequest } from 'fastify';
+import * as http from 'http';
 
 describe('FastifyAdapter', () => {
   let fastifyAdapter: FastifyAdapter;
@@ -253,6 +254,163 @@ describe('FastifyAdapter', () => {
         url: '/neutral',
       });
       expect(res.statusCode).toBe(200);
+    });
+  });
+
+  describe('graceful shutdown (return503OnClosing)', () => {
+    const listen = async (adapter: FastifyAdapter) => {
+      await adapter.getInstance().ready();
+      const server = adapter.getHttpServer() as http.Server;
+      await new Promise<void>(resolve =>
+        server.listen(0, '127.0.0.1', resolve),
+      );
+      return (server.address() as { port: number }).port;
+    };
+
+    const request = (
+      port: number,
+      path: string,
+      headers: Record<string, string> = {},
+    ): Promise<{ status: number; body: string; connection?: string }> =>
+      new Promise((resolve, reject) => {
+        http
+          .get(`http://127.0.0.1:${port}${path}`, { headers }, res => {
+            let body = '';
+            res.on('data', chunk => (body += chunk));
+            res.on('end', () =>
+              resolve({
+                status: res.statusCode!,
+                body,
+                connection: res.headers.connection,
+              }),
+            );
+          })
+          .on('error', reject);
+      });
+
+    afterEach(async () => {
+      await fastifyAdapter.close();
+    });
+
+    it('should reject new requests with 503 once closing begins', async () => {
+      fastifyAdapter.initHttpServer({ return503OnClosing: true });
+      fastifyAdapter.get('/work', (_req, reply) =>
+        fastifyAdapter.reply(reply, 'ok', 200),
+      );
+      const port = await listen(fastifyAdapter);
+
+      const before = await request(port, '/work');
+      expect(before.status).toBe(200);
+      expect(before.body).toBe('ok');
+
+      fastifyAdapter.beforeClose();
+
+      const during = await request(port, '/work');
+      expect(during.status).toBe(503);
+      expect(during.body).toBe('Service Unavailable');
+      expect(during.connection).toBe('close');
+    });
+
+    it('should let in-flight requests complete when closing begins', async () => {
+      fastifyAdapter.initHttpServer({ return503OnClosing: true });
+      fastifyAdapter.get('/slow', async (_req, reply) => {
+        await new Promise(resolve => setTimeout(resolve, 300));
+        return fastifyAdapter.reply(reply, 'ok', 200);
+      });
+      const port = await listen(fastifyAdapter);
+
+      // "Connection: close" so the server does not wait out the keep-alive
+      // timeout after the response (same pattern as the Express adapter tests)
+      const inFlight = request(port, '/slow', { Connection: 'close' });
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      fastifyAdapter.beforeClose();
+      const closePromise = fastifyAdapter.close();
+
+      const response = await inFlight;
+      expect(response.status).toBe(200);
+      expect(response.body).toBe('ok');
+      await closePromise;
+    });
+
+    it('should reject requests queued on a reused keep-alive connection', async () => {
+      fastifyAdapter.initHttpServer({ return503OnClosing: true });
+      fastifyAdapter.get('/slow', async (_req, reply) => {
+        await new Promise(resolve => setTimeout(resolve, 300));
+        return fastifyAdapter.reply(reply, 'ok', 200);
+      });
+      const port = await listen(fastifyAdapter);
+
+      const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+      const queuedRequest = () =>
+        new Promise<{ status: number; body: string; connection?: string }>(
+          (resolve, reject) => {
+            http
+              .get(`http://127.0.0.1:${port}/slow`, { agent }, res => {
+                let body = '';
+                res.on('data', chunk => (body += chunk));
+                res.on('end', () =>
+                  resolve({
+                    status: res.statusCode!,
+                    body,
+                    connection: res.headers.connection,
+                  }),
+                );
+              })
+              .on('error', reject);
+          },
+        );
+
+      try {
+        const inFlight = queuedRequest();
+        await new Promise(resolve => setTimeout(resolve, 100));
+
+        fastifyAdapter.beforeClose();
+        const closePromise = fastifyAdapter.close();
+
+        // Queued behind the in-flight request on the same socket
+        const queued = queuedRequest();
+
+        const inFlightResponse = await inFlight;
+        expect(inFlightResponse.status).toBe(200);
+
+        const queuedResponse = await queued;
+        expect(queuedResponse.status).toBe(503);
+        expect(queuedResponse.body).toBe('Service Unavailable');
+        expect(queuedResponse.connection).toBe('close');
+
+        await closePromise;
+      } finally {
+        agent.destroy();
+      }
+    });
+
+    it('should be idempotent across repeated close() calls', async () => {
+      fastifyAdapter.initHttpServer({ return503OnClosing: true });
+      fastifyAdapter.get('/work', (_req, reply) =>
+        fastifyAdapter.reply(reply, 'ok', 200),
+      );
+      await listen(fastifyAdapter);
+
+      await fastifyAdapter.close();
+      await expect(fastifyAdapter.close()).resolves.toBeUndefined();
+      await expect(fastifyAdapter.close()).resolves.toBeUndefined();
+    });
+
+    it('should keep serving requests after beforeClose when the option is disabled', async () => {
+      fastifyAdapter.initHttpServer({});
+      fastifyAdapter.get('/work', (_req, reply) =>
+        fastifyAdapter.reply(reply, 'ok', 200),
+      );
+      const port = await listen(fastifyAdapter);
+
+      fastifyAdapter.beforeClose();
+
+      // The gate is absent, so requests still reach Fastify while the
+      // server is listening.
+      const response = await request(port, '/work', { Connection: 'close' });
+      expect(response.status).toBe(200);
+      expect(response.body).toBe('ok');
     });
   });
 });
