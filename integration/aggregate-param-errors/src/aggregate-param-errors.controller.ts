@@ -3,6 +3,7 @@ import {
   ArgumentsHost,
   BadRequestException,
   Body,
+  CanActivate,
   Catch,
   ConflictException,
   Controller,
@@ -13,12 +14,16 @@ import {
   ForbiddenException,
   Get,
   Headers,
+  HttpException,
+  HttpStatus,
+  Injectable,
   NotFoundException,
   Param,
   PipeTransform,
   Post,
   Query,
   UseFilters,
+  UseGuards,
 } from '@nestjs/common';
 import { HttpAdapterHost } from '@nestjs/core';
 
@@ -130,6 +135,69 @@ class CurrencyPipe implements PipeTransform<string | undefined, string> {
   }
 }
 
+// Upper bound (inclusive) of the decimal range accepted by the batch routes.
+const MAX_BATCH_VALUE = 2147483647;
+
+// Strict decimal conversion shared by the batch routes: only non-empty values
+// consisting solely of ASCII digits and converting to an integer between 0
+// and 2147483647 (inclusive) are accepted. Scientific notation, hex, signs,
+// whitespace padding and fractional input all fail; leading zeros convert
+// normally ('004' -> 4).
+function parseBatchValue(raw: unknown): number | null {
+  if (typeof raw !== 'string' || !/^[0-9]+$/.test(raw)) {
+    return null;
+  }
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed > MAX_BATCH_VALUE) {
+    return null;
+  }
+  return parsed;
+}
+
+// An invalid batch id is not a parameter-validation error to be aggregated:
+// it aborts the whole request immediately (before any item is inspected) with
+// a plain single-message 400 body, so it must not be collected into the
+// aggregated message array of the annotated route.
+class InvalidBatchIdException extends HttpException {
+  constructor() {
+    super(
+      {
+        statusCode: HttpStatus.BAD_REQUEST,
+        error: 'Bad Request',
+        message: 'ID',
+      },
+      HttpStatus.BAD_REQUEST,
+    );
+  }
+}
+
+class BatchIdPipe implements PipeTransform<string, number> {
+  transform(value: string): number {
+    const parsed = parseBatchValue(value);
+    if (parsed === null) {
+      throw new InvalidBatchIdException();
+    }
+    return parsed;
+  }
+}
+
+// The id is validated before any parameter pipe runs (guards execute ahead of
+// pipes on annotated and unannotated routes alike), so an invalid id always
+// aborts the request with the plain 'ID' 400 and no item is ever inspected -
+// regardless of the order in which concurrent parameter pipes would settle.
+@Injectable()
+class BatchIdGuard implements CanActivate {
+  canActivate(context: ExecutionContext): boolean {
+    isolationState.pipeCalls.push('ID');
+    const request = context.switchToHttp().getRequest();
+    const parsed = parseBatchValue(request.params?.id);
+    if (parsed === null) {
+      throw new InvalidBatchIdException();
+    }
+    return true;
+  }
+}
+
 // Converts a repeatable `item` query key (`?item=2&item=4`) one element at a
 // time, in appearance order. Conversion errors are aggregated and stay
 // indexable (ITEM[0], ITEM[2], ...); `deny` is not a request-parameter error
@@ -155,8 +223,8 @@ class BatchItemsPipe implements PipeTransform<
         // the whole parameter resolution; messages staged earlier are dropped.
         throw new ConflictException('DENIED');
       }
-      const parsed = Number(raw);
-      if (raw.trim() === '' || Number.isNaN(parsed)) {
+      const parsed = parseBatchValue(raw);
+      if (parsed === null) {
         messages.push(`ITEM[${index}]`);
         return;
       }
@@ -257,8 +325,8 @@ class BatchItemsFailFastPipe implements PipeTransform<
       if (raw === 'deny') {
         throw new ConflictException('DENIED');
       }
-      const parsed = Number(raw);
-      if (raw.trim() === '' || Number.isNaN(parsed)) {
+      const parsed = parseBatchValue(raw);
+      if (parsed === null) {
         throw new BadRequestException(`ITEM[${index}]`);
       }
       numbers.push(parsed);
@@ -528,24 +596,27 @@ export class AggregateParamErrorsController {
 // Root-level controller for the repeatable-query-key batch routes. The marked
 // route aggregates the per-element conversion feedback of a single request;
 // the unannotated route keeps the legacy fail-fast short-circuit for contrast.
+// On both routes an invalid id aborts the request immediately with a plain
+// single-message 400 ('ID') before any item is inspected.
 @Controller()
+@UseGuards(BatchIdGuard)
 export class BatchController {
   @AggregateParamErrors()
   @Get('batch/:id')
   public batch(
-    @Param('id', new NumberPipe('A')) id: number,
+    @Param('id', new BatchIdPipe()) id: number,
     @Query('item', new BatchItemsPipe()) items: number[],
   ) {
     recordHandler('batch');
     return { id, items };
   }
 
-  @Get('batch-legacy/:id')
-  public batchLegacy(
-    @Param('id', new NumberPipe('A')) id: number,
+  @Get('batch-plain/:id')
+  public batchPlain(
+    @Param('id', new BatchIdPipe()) id: number,
     @Query('item', new BatchItemsFailFastPipe()) items: number[],
   ) {
-    recordHandler('batchLegacy');
+    recordHandler('batchPlain');
     return { id, items };
   }
 }
