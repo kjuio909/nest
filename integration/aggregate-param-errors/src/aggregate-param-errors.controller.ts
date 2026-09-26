@@ -3,6 +3,7 @@ import {
   ArgumentsHost,
   BadRequestException,
   Body,
+  type CanActivate,
   Catch,
   ConflictException,
   Controller,
@@ -13,12 +14,16 @@ import {
   ForbiddenException,
   Get,
   Headers,
+  HttpException,
+  HttpStatus,
+  Injectable,
   NotFoundException,
   Param,
-  PipeTransform,
+  type PipeTransform,
   Post,
   Query,
   UseFilters,
+  UseGuards,
 } from '@nestjs/common';
 import { HttpAdapterHost } from '@nestjs/core';
 
@@ -130,10 +135,49 @@ class CurrencyPipe implements PipeTransform<string | undefined, string> {
   }
 }
 
+// Largest accepted decimal integer (inclusive): an id/item is valid only when
+// it is non-empty ASCII digits whose value fits a signed 31-bit integer.
+const MAX_INT = 2147483647;
+
+// Strict decimal-integer gate shared by ids and items: non-empty, ASCII digits
+// only, value in [0, 2147483647]. Anything else - whitespace, signs,
+// exponent notation, hex, padded values that still overflow, ... - is invalid.
+function isDecimalInt31(raw: unknown): raw is string {
+  return (
+    typeof raw === 'string' &&
+    raw.length > 0 &&
+    /^[0-9]+$/.test(raw) &&
+    Number(raw) <= MAX_INT
+  );
+}
+
+// Runs before any parameter pipe on both batch routes: an invalid id ends the
+// request immediately with one single, unindexed message, and the item query
+// is never touched. A raw 400 HttpException (rather than BadRequestException)
+// keeps the response a bare string even inside the aggregated parameter
+// resolution, which would otherwise wrap a BadRequest message into an array.
+@Injectable()
+export class BatchIdGuard implements CanActivate {
+  public canActivate(context: ExecutionContext): boolean {
+    const request = context.switchToHttp().getRequest<{
+      params?: Record<string, unknown>;
+    }>();
+    const rawId = request.params?.['id'];
+    isolationState.pipeCalls.push('ID');
+    if (!isDecimalInt31(rawId)) {
+      throw new HttpException('ID', HttpStatus.BAD_REQUEST);
+    }
+    return true;
+  }
+}
+
 // Converts a repeatable `item` query key (`?item=2&item=4`) one element at a
-// time, in appearance order. Conversion errors are aggregated and stay
-// indexable (ITEM[0], ITEM[2], ...); `deny` is not a request-parameter error
-// but a conflict that aborts the resolution immediately.
+// time, in appearance order. Every element is checked: conversion errors are
+// aggregated with their original position (ITEM[0], ITEM[2], ...) and rethrown
+// as a single BadRequestException after the full list was inspected. A missing
+// key is reported as `ITEM`; an explicitly empty element exists and fails as
+// `ITEM[0]`. `deny` is not a request-parameter error but a conflict that
+// terminates conversion immediately, discarding every message staged so far.
 class BatchItemsPipe implements PipeTransform<
   string[] | string | undefined,
   number[]
@@ -155,12 +199,11 @@ class BatchItemsPipe implements PipeTransform<
         // the whole parameter resolution; messages staged earlier are dropped.
         throw new ConflictException('DENIED');
       }
-      const parsed = Number(raw);
-      if (raw.trim() === '' || Number.isNaN(parsed)) {
+      if (!isDecimalInt31(raw)) {
         messages.push(`ITEM[${index}]`);
         return;
       }
-      numbers.push(parsed);
+      numbers.push(Number(raw));
     });
     if (messages.length > 0) {
       throw new BadRequestException(messages);
@@ -247,6 +290,7 @@ class BatchItemsFailFastPipe implements PipeTransform<
 > {
   transform(value: string[] | string | undefined): number[] {
     if (value === undefined) {
+      isolationState.pipeCalls.push('ITEM');
       throw new BadRequestException('ITEM');
     }
     const items = Array.isArray(value) ? value : [value];
@@ -257,11 +301,10 @@ class BatchItemsFailFastPipe implements PipeTransform<
       if (raw === 'deny') {
         throw new ConflictException('DENIED');
       }
-      const parsed = Number(raw);
-      if (raw.trim() === '' || Number.isNaN(parsed)) {
+      if (!isDecimalInt31(raw)) {
         throw new BadRequestException(`ITEM[${index}]`);
       }
-      numbers.push(parsed);
+      numbers.push(Number(raw));
     }
     return numbers;
   }
@@ -528,24 +571,28 @@ export class AggregateParamErrorsController {
 // Root-level controller for the repeatable-query-key batch routes. The marked
 // route aggregates the per-element conversion feedback of a single request;
 // the unannotated route keeps the legacy fail-fast short-circuit for contrast.
+// Both share BatchIdGuard, so an invalid id ends the request with the bare
+// `ID` message before a single item is inspected.
 @Controller()
 export class BatchController {
   @AggregateParamErrors()
+  @UseGuards(BatchIdGuard)
   @Get('batch/:id')
   public batch(
-    @Param('id', new NumberPipe('A')) id: number,
+    @Param('id') id: string,
     @Query('item', new BatchItemsPipe()) items: number[],
   ) {
     recordHandler('batch');
-    return { id, items };
+    return { id: Number(id), items };
   }
 
-  @Get('batch-legacy/:id')
-  public batchLegacy(
-    @Param('id', new NumberPipe('A')) id: number,
+  @UseGuards(BatchIdGuard)
+  @Get('batch-plain/:id')
+  public batchPlain(
+    @Param('id') id: string,
     @Query('item', new BatchItemsFailFastPipe()) items: number[],
   ) {
-    recordHandler('batchLegacy');
-    return { id, items };
+    recordHandler('batchPlain');
+    return { id: Number(id), items };
   }
 }
