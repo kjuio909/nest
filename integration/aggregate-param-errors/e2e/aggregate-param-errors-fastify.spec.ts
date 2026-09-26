@@ -261,4 +261,89 @@ describe('AggregateParamErrors (Fastify)', () => {
       });
     });
   });
+
+  describe('when a @Query() key repeats (batch route)', () => {
+    it('converts every value in order and returns the array', async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/batch/7?item=2&item=4',
+      });
+      expect(response.statusCode).toBe(HttpStatus.OK);
+      expect(response.json()).toEqual({ id: 7, items: [2, 4] });
+    });
+
+    it('keeps the array shape when a single value is present', async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/batch/7?item=2',
+      });
+      expect(response.statusCode).toBe(HttpStatus.OK);
+      expect(response.json()).toEqual({ id: 7, items: [2] });
+    });
+
+    it('aggregates invalid elements by their original index in one 400', async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/batch/7?item=x&item=3&item=y',
+      });
+      expect(response.statusCode).toBe(HttpStatus.BAD_REQUEST);
+      expect(response.json()).toEqual({
+        statusCode: 400,
+        error: 'Bad Request',
+        message: ['ITEM[0]', 'ITEM[2]'],
+      });
+    });
+
+    it('reports a completely missing item key as ITEM', async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/batch/7',
+      });
+      expect(response.statusCode).toBe(HttpStatus.BAD_REQUEST);
+      expect(response.json()).toEqual({
+        statusCode: 400,
+        error: 'Bad Request',
+        message: ['ITEM'],
+      });
+    });
+
+    it('treats an explicitly empty value as present but invalid', async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/batch/7?item=',
+      });
+      expect(response.statusCode).toBe(HttpStatus.BAD_REQUEST);
+      expect(response.json()).toEqual({
+        statusCode: 400,
+        error: 'Bad Request',
+        message: ['ITEM[0]'],
+      });
+    });
+
+    it('aborts with 409 DENIED on the deny sentinel and discards staged errors', async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/batch/7?item=x&item=deny&item=y',
+      });
+      expect(response.statusCode).toBe(HttpStatus.CONFLICT);
+      expect(response.json()).toEqual({
+        statusCode: 409,
+        error: 'Conflict',
+        message: 'DENIED',
+      });
+    });
+
+    it('keeps the unmarked compatibility route fail-fast with a single error body', async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/batch/legacy/7?item=x&item=3&item=y',
+      });
+      expect(response.statusCode).toBe(HttpStatus.BAD_REQUEST);
+      expect(response.json()).toEqual({
+        statusCode: 400,
+        error: 'Bad Request',
+        message: 'ITEM[0]',
+      });
+    });
+  });
 });

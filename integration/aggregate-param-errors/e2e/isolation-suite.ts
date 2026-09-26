@@ -294,6 +294,88 @@ export function registerIsolationSuite(deps: IsolationSuiteDeps): void {
       });
     });
 
+    describe('batch route with a repeatable @Query() key', () => {
+      it('keeps interleaved success, single-error, multi-error, missing and denied requests isolated', async () => {
+        const ok = await request('GET', '/batch/7?item=2&item=4');
+        expect(ok.status).toBe(200);
+        expect(ok.body).toEqual({ id: 7, items: [2, 4] });
+        expect(isolationState.handlerCalls.batch).toBe(1);
+
+        const singleError = await request('GET', '/batch/8?item=y');
+        expect(singleError.status).toBe(400);
+        expect(singleError.body.message).toEqual(['ITEM[0]']);
+
+        const multiError = await request('GET', '/batch/9?item=x&item=3&item=y');
+        expect(multiError.status).toBe(400);
+        expect(multiError.body.message).toEqual(['ITEM[0]', 'ITEM[2]']);
+
+        const missing = await request('GET', '/batch/10');
+        expect(missing.status).toBe(400);
+        expect(missing.body.message).toEqual(['ITEM']);
+
+        const denied = await request('GET', '/batch/11?item=x&item=deny');
+        expect(denied.status).toBe(409);
+        expect(denied.body.message).toBe('DENIED');
+
+        // Only the first request reached the handler; every request re-ran
+        // both conversions and no staged message crossed a request boundary.
+        expect(isolationState.handlerCalls.batch).toBe(1);
+        expect(isolationState.pipeCalls).toEqual([
+          'A', 'ITEM',
+          'A', 'ITEM',
+          'A', 'ITEM',
+          'A', 'ITEM',
+          'A', 'ITEM',
+        ]);
+      });
+
+      it('converts each element of this request only, in appearance order', async () => {
+        const failed = await request('GET', '/batch/7?item=x&item=3&item=y');
+        expect(failed.body.message).toEqual(['ITEM[0]', 'ITEM[2]']);
+        expect(isolationState.handlerCalls.batch ?? 0).toBe(0);
+
+        const ok = await request('GET', '/batch/7?item=2&item=4');
+        expect(ok.status).toBe(200);
+        expect(ok.body).toEqual({ id: 7, items: [2, 4] });
+        expect(isolationState.handlerCalls.batch).toBe(1);
+      });
+
+      it('keeps a concurrent success and failure isolated', async () => {
+        const [ok, failed] = await Promise.all([
+          request('GET', '/batch/7?item=2&item=4'),
+          request('GET', '/batch/8?item=x&item=y'),
+        ]);
+
+        expect(ok.status).toBe(200);
+        expect(ok.body).toEqual({ id: 7, items: [2, 4] });
+        expect(failed.status).toBe(400);
+        expect(failed.body.message).toEqual(['ITEM[0]', 'ITEM[1]']);
+
+        // Each request converted its own elements exactly once; the handler
+        // ran only for the successful request.
+        expect(isolationState.pipeCalls.filter(t => t === 'A')).toHaveLength(2);
+        expect(
+          isolationState.pipeCalls.filter(t => t === 'ITEM'),
+        ).toHaveLength(2);
+        expect(isolationState.handlerCalls.batch).toBe(1);
+      });
+
+      it('keeps the unmarked batch compatibility route fail-fast and independent', async () => {
+        const legacyFailed = await request(
+          'GET',
+          '/batch/legacy/7?item=x&item=y',
+        );
+        expect(legacyFailed.status).toBe(400);
+        expect(legacyFailed.body.message).toBe('ITEM[0]');
+        expect(isolationState.handlerCalls.batchLegacy ?? 0).toBe(0);
+
+        const ok = await request('GET', '/batch/7?item=2');
+        expect(ok.status).toBe(200);
+        expect(ok.body).toEqual({ id: 7, items: [2] });
+        expect(isolationState.handlerCalls.batch).toBe(1);
+      });
+    });
+
     describe('@Body() and custom extractor scope', () => {
       it('does not aggregate a @Body() pipe error even when a @Param() failed first', async () => {
         const bodyFailure = await request('POST', '/p/body/abc?limit=x', {

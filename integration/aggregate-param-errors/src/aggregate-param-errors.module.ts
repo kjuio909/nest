@@ -1,7 +1,13 @@
 import { Module } from '@nestjs/common';
-import { AggregateParamErrorsController } from './aggregate-param-errors.controller.js';
+import {
+  AggregateParamErrorsBatchController,
+  AggregateParamErrorsController,
+} from './aggregate-param-errors.controller.js';
 
 @Module({
-  controllers: [AggregateParamErrorsController],
+  controllers: [
+    AggregateParamErrorsController,
+    AggregateParamErrorsBatchController,
+  ],
 })
 export class AggregateParamErrorsModule {}

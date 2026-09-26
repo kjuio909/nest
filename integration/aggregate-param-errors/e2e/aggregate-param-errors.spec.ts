@@ -204,4 +204,76 @@ describe('AggregateParamErrors (Express)', () => {
         });
     });
   });
+
+  describe('when a @Query() key repeats (batch route)', () => {
+    it('converts every value in order and returns the array', () => {
+      return request(server)
+        .get('/batch/7?item=2&item=4')
+        .expect(200, { id: 7, items: [2, 4] });
+    });
+
+    it('keeps the array shape when a single value is present', () => {
+      return request(server)
+        .get('/batch/7?item=2')
+        .expect(200, {
+          id: 7,
+          items: [2],
+        });
+    });
+
+    it('aggregates invalid elements by their original index in one 400', () => {
+      return request(server)
+        .get('/batch/7?item=x&item=3&item=y')
+        .expect(400)
+        .expect({
+          statusCode: 400,
+          error: 'Bad Request',
+          message: ['ITEM[0]', 'ITEM[2]'],
+        });
+    });
+
+    it('reports a completely missing item key as ITEM', () => {
+      return request(server)
+        .get('/batch/7')
+        .expect(400)
+        .expect({
+          statusCode: 400,
+          error: 'Bad Request',
+          message: ['ITEM'],
+        });
+    });
+
+    it('treats an explicitly empty value as present but invalid', () => {
+      return request(server)
+        .get('/batch/7?item=')
+        .expect(400)
+        .expect({
+          statusCode: 400,
+          error: 'Bad Request',
+          message: ['ITEM[0]'],
+        });
+    });
+
+    it('aborts with 409 DENIED on the deny sentinel and discards staged errors', () => {
+      return request(server)
+        .get('/batch/7?item=x&item=deny&item=y')
+        .expect(409)
+        .expect({
+          statusCode: 409,
+          error: 'Conflict',
+          message: 'DENIED',
+        });
+    });
+
+    it('keeps the unmarked compatibility route fail-fast with a single error body', () => {
+      return request(server)
+        .get('/batch/legacy/7?item=x&item=3&item=y')
+        .expect(400)
+        .expect({
+          statusCode: 400,
+          error: 'Bad Request',
+          message: 'ITEM[0]',
+        });
+    });
+  });
 });
