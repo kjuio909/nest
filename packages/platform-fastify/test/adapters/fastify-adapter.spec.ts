@@ -255,4 +255,20 @@ describe('FastifyAdapter', () => {
       expect(res.statusCode).toBe(200);
     });
   });
+
+  describe('close', () => {
+    it('should be idempotent across repeated close() calls', async () => {
+      fastifyAdapter.initHttpServer({ return503OnClosing: true });
+      await fastifyAdapter.getInstance().ready();
+
+      await fastifyAdapter.close();
+      await expect(fastifyAdapter.close()).resolves.toBeUndefined();
+    });
+
+    it('should not throw when the server was never started', async () => {
+      fastifyAdapter.initHttpServer({ return503OnClosing: true });
+
+      await expect(fastifyAdapter.close()).resolves.toBeUndefined();
+    });
+  });
 });

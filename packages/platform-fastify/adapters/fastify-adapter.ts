@@ -5,6 +5,7 @@ import {
   HttpException,
   HttpStatus,
   Logger,
+  type NestApplicationOptions,
   type RawBodyRequest,
   type RequestMethod,
   StreamableFile,
@@ -167,6 +168,8 @@ export class FastifyAdapter<
   private isMiddieRegistered: boolean;
   private pendingMiddlewares: Array<{ args: any[] }> = [];
   private versioningOptions?: VersioningOptions;
+  private isShuttingDown = false;
+  private closePromise?: Promise<void>;
   private readonly versionConstraint = {
     name: 'version',
     validate(value: unknown) {
@@ -556,19 +559,28 @@ export class FastifyAdapter<
   }
 
   public async close() {
-    try {
-      return await this.instance.close();
-    } catch (err) {
-      // Check if server is still running
-      if (err.code !== 'ERR_SERVER_NOT_RUNNING') {
-        throw err;
-      }
-      return;
-    }
+    // Flip into the shutting-down state even when "return503OnClosing" is
+    // not enabled (mirroring the Express adapter); the flag is only
+    // observed by the request gate installed for that option.
+    this.isShuttingDown = true;
+    // Cache the close operation so that repeated "app.close()" calls (the
+    // core allows a shutdown cycle to run again once the previous one has
+    // settled) neither close the underlying instance twice nor re-open the
+    // request gate.
+    this.closePromise ??= this.closeInstance();
+    return this.closePromise;
   }
 
-  public initHttpServer() {
+  public beforeClose() {
+    this.isShuttingDown = true;
+  }
+
+  public initHttpServer(options?: NestApplicationOptions) {
     this.httpServer = this.instance.server;
+
+    if (options?.return503OnClosing) {
+      this.installClosingRequestGate();
+    }
   }
 
   public async useStaticAssets(options: FastifyStaticOptions) {
@@ -819,6 +831,49 @@ export class FastifyAdapter<
     response: TRawResponse | TReply,
   ): response is TRawResponse {
     return !('status' in response);
+  }
+
+  private async closeInstance(): Promise<void> {
+    try {
+      await this.instance.close();
+    } catch (err) {
+      // Check if server is still running
+      if (err.code !== 'ERR_SERVER_NOT_RUNNING') {
+        throw err;
+      }
+    }
+  }
+
+  /**
+   * Installs a request gate in front of Fastify's routing so that, once the
+   * shutdown has started, new requests are rejected with
+   * "503 Service Unavailable" before they can enter the Nest pipeline
+   * (middleware, guards, pipes, interceptors, handlers), while requests
+   * that were already accepted run to completion.
+   *
+   * The gate wraps the server's "request" listener instead of using a
+   * Fastify "onRequest" hook because Fastify's own "return503OnClosing"
+   * fast path (enabled by default) runs before any hook and answers with a
+   * JSON body, which would not match the Express-compatible contract (a
+   * plain "Service Unavailable" body and a "Connection: close" header).
+   */
+  private installClosingRequestGate() {
+    const server = this.httpServer as unknown as http.Server;
+    const routing = this.instance.routing;
+    server.removeListener('request', routing);
+    server.on('request', (req, res) => {
+      if (!this.isShuttingDown) {
+        routing(req as unknown as TRawRequest, res as unknown as TRawResponse);
+        return;
+      }
+      if (req.httpVersionMajor !== 2) {
+        res.setHeader('Connection', 'close');
+      }
+      res.writeHead(HttpStatus.SERVICE_UNAVAILABLE, {
+        'Content-Type': 'text/plain',
+      });
+      res.end('Service Unavailable');
+    });
   }
 
   private registerJsonContentParser(rawBody?: boolean) {
