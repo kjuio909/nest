@@ -78,6 +78,13 @@ type FastifyAdapterBaseOptions<
   Logger extends FastifyBaseLogger = FastifyBaseLogger,
 > = FastifyServerOptions<Server, Logger> & {
   skipMiddie?: boolean;
+  /**
+   * Enables the graceful-shutdown request gate: once the application starts
+   * closing, new requests are rejected with "503 Service Unavailable" before
+   * they can enter the Nest pipeline, while in-flight requests run to
+   * completion. Mirrors the "return503OnClosing" application option.
+   */
+  return503OnClosing?: boolean;
 };
 
 type FastifyHttp2SecureOptions<
@@ -170,6 +177,7 @@ export class FastifyAdapter<
   private versioningOptions?: VersioningOptions;
   private isShuttingDown = false;
   private closePromise?: Promise<void>;
+  private return503OnClosing = false;
   private readonly versionConstraint = {
     name: 'version',
     validate(value: unknown) {
@@ -278,6 +286,13 @@ export class FastifyAdapter<
     if ((instanceOrOptions as FastifyAdapterBaseOptions)?.skipMiddie) {
       this.isMiddieRegistered = true;
     }
+
+    // The option doubles as a native Fastify server option, where it is
+    // forwarded untouched; the adapter only records it here so that
+    // "initHttpServer" installs its own (Express-compatible) request gate
+    // even when no application-level "return503OnClosing" option is set.
+    this.return503OnClosing =
+      !!(instanceOrOptions as FastifyAdapterBaseOptions)?.return503OnClosing;
 
     this.instance.addHook('onRequest', (request, reply, done) => {
       if (this.onRequestHook) {
@@ -578,7 +593,7 @@ export class FastifyAdapter<
   public initHttpServer(options?: NestApplicationOptions) {
     this.httpServer = this.instance.server;
 
-    if (options?.return503OnClosing) {
+    if (options?.return503OnClosing || this.return503OnClosing) {
       this.installClosingRequestGate();
     }
   }
@@ -851,11 +866,24 @@ export class FastifyAdapter<
    * (middleware, guards, pipes, interceptors, handlers), while requests
    * that were already accepted run to completion.
    *
-   * The gate wraps the server's "request" listener instead of using a
-   * Fastify "onRequest" hook because Fastify's own "return503OnClosing"
-   * fast path (enabled by default) runs before any hook and answers with a
-   * JSON body, which would not match the Express-compatible contract (a
-   * plain "Service Unavailable" body and a "Connection: close" header).
+   * The gate has two layers:
+   *
+   * - a wrapper around the server's "request" listener, which rejects every
+   *   request whose headers arrive after the shutdown started — including
+   *   requests pipelined on an existing keep-alive connection. The listener
+   *   is wrapped instead of using a Fastify "onRequest" hook because
+   *   Fastify's own "return503OnClosing" fast path (enabled by default)
+   *   runs before any hook and answers with a JSON body, which would not
+   *   match the Express-compatible contract (a plain "Service Unavailable"
+   *   body and a "Connection: close" header);
+   * - a "preHandler" hook, which covers requests that were accepted by the
+   *   first layer while the application was still running but have not
+   *   reached a route handler yet when the shutdown starts — most notably
+   *   requests whose body is still streaming in. Fastify runs "preHandler"
+   *   hooks after the request body has been fully received and right before
+   *   the route handler (where the Nest pipeline begins), so a late
+   *   rejection here still happens before any guard, pipe, interceptor or
+   *   controller runs and cannot trigger business side effects.
    */
   private installClosingRequestGate() {
     const server = this.httpServer as unknown as http.Server;
@@ -873,6 +901,21 @@ export class FastifyAdapter<
         'Content-Type': 'text/plain',
       });
       res.end('Service Unavailable');
+    });
+
+    this.instance.addHook('preHandler', (request, reply, done) => {
+      if (!this.isShuttingDown) {
+        done();
+        return;
+      }
+      if (request.raw.httpVersionMajor !== 2) {
+        reply.header('Connection', 'close');
+      }
+      // Short-circuit the lifecycle without calling "done()".
+      reply
+        .code(HttpStatus.SERVICE_UNAVAILABLE)
+        .header('Content-Type', 'text/plain')
+        .send('Service Unavailable');
     });
   }
 

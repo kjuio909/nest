@@ -18,7 +18,9 @@ import {
   NestFastifyApplication,
 } from '@nestjs/platform-fastify';
 import * as http from 'http';
+import * as net from 'net';
 import { AppModule } from '../src/app.module.js';
+import { appCounters, resetAppCounters } from '../src/app.controller.js';
 
 interface RawResponse {
   status: number;
@@ -297,5 +299,228 @@ describe('Graceful Shutdown (Fastify)', () => {
 
     await app.close();
     await expect(app.close()).resolves.toBeUndefined();
+  }, 10000);
+
+  it('should enable the gate via the FastifyAdapter "return503OnClosing" option', async () => {
+    app = await NestFactory.create<NestFastifyApplication>(
+      AppModule,
+      new FastifyAdapter({ return503OnClosing: true }),
+      {
+        logger: false,
+      },
+    );
+    await app.listen(0);
+    const port = app.getHttpServer().address().port;
+
+    const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+
+    // Request A (slow) occupies the only socket
+    const requestA = request(port, '/slow', agent);
+    await new Promise(r => setTimeout(r, 100));
+
+    const closePromise = app.close();
+    await new Promise(r => setTimeout(r, 0));
+
+    // Request B is queued on the same connection and arrives after the
+    // shutdown state has been established
+    const requestB = request(port, '/slow', agent);
+
+    const responseA = await requestA;
+    expect(responseA.status).toBe(200);
+    expect(responseA.body).toBe('ok');
+
+    const responseB = await requestB;
+    expect(responseB.status).toBe(503);
+    expect(responseB.body).toBe('Service Unavailable');
+    expect(responseB.headers['connection']).toBe('close');
+
+    await closePromise;
+    agent.destroy();
+  }, 10000);
+
+  it('should reject a request whose body completes after shutdown started, without side effects', async () => {
+    resetAppCounters();
+
+    app = await NestFactory.create<NestFastifyApplication>(
+      AppModule,
+      new FastifyAdapter({ return503OnClosing: true }),
+      {
+        logger: false,
+      },
+    );
+    await app.listen(0);
+    const port = app.getHttpServer().address().port;
+
+    const socket = net.createConnection(port, '127.0.0.1');
+    socket.on('error', () => {});
+    await new Promise<void>(resolve => socket.once('connect', resolve));
+
+    const body = JSON.stringify({ hello: 'world' });
+    socket.write(
+      `POST /echo HTTP/1.1\r\nHost: localhost:${port}\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n`,
+    );
+    // Only the first chunk of the body goes out before the shutdown starts
+    socket.write(body.slice(0, 5));
+    await new Promise(r => setTimeout(r, 50));
+
+    const closePromise = app.close();
+    // Let the shutdown state establish
+    await new Promise(r => setTimeout(r, 50));
+
+    // The remaining bytes arrive after the shutdown has started
+    socket.write(body.slice(5));
+
+    // The server answers with the rejection and closes the connection
+    const rawResponse = await new Promise<string>(resolve => {
+      let data = '';
+      socket.on('data', chunk => (data += chunk));
+      socket.on('end', () => resolve(data));
+    });
+    expect(rawResponse).toContain(' 503 ');
+    expect(rawResponse.toLowerCase()).toContain('connection: close');
+    expect(rawResponse).toContain('Service Unavailable');
+
+    // A follow-up request on the same connection cannot go through anymore:
+    // the connection is closed, so it gets no response at all
+    let extraData = '';
+    socket.on('data', chunk => (extraData += chunk));
+    socket.write('GET /slow HTTP/1.1\r\nHost: localhost\r\n\r\n');
+    await new Promise(r => setTimeout(r, 150));
+    expect(extraData).toBe('');
+
+    await closePromise;
+
+    // The late body bytes must not trigger any business side effect
+    expect(appCounters.echoCount).toBe(0);
+    expect(appCounters.handlerEntries).toBe(0);
+
+    socket.destroy();
+  }, 10000);
+
+  it('should preserve status and body of an in-flight request that throws', async () => {
+    app = await NestFactory.create<NestFastifyApplication>(
+      AppModule,
+      new FastifyAdapter({ return503OnClosing: true }),
+      {
+        logger: false,
+      },
+    );
+    await app.listen(0);
+    const port = app.getHttpServer().address().port;
+
+    const requestPromise = request(port, '/error');
+    await new Promise(r => setTimeout(r, 20));
+
+    const closePromise = app.close();
+
+    const response = await requestPromise;
+    expect(response.status).toBe(500);
+    expect(response.body).toContain('Internal server error');
+
+    await closePromise;
+  }, 10000);
+
+  it('should wait for the in-flight request and run cleanup once across concurrent close() calls', async () => {
+    resetAppCounters();
+
+    app = await NestFactory.create<NestFastifyApplication>(
+      AppModule,
+      new FastifyAdapter({ return503OnClosing: true }),
+      {
+        logger: false,
+      },
+    );
+    await app.listen(0);
+    const port = app.getHttpServer().address().port;
+
+    let requestSettled = false;
+    const requestPromise = request(port, '/slow?delay=400').then(response => {
+      requestSettled = true;
+      return response;
+    });
+    await new Promise(r => setTimeout(r, 100));
+
+    // Two concurrent close() calls share the same shutdown cycle
+    const closeStart = Date.now();
+    await Promise.all([app.close(), app.close()]);
+    const closeElapsed = Date.now() - closeStart;
+
+    // Both calls resolved only after the in-flight request had finished
+    // (the remaining ~300ms of work had to elapse first)
+    expect(closeElapsed).toBeGreaterThanOrEqual(150);
+    const response = await requestPromise;
+    expect(requestSettled).toBe(true);
+    expect(response.status).toBe(200);
+    expect(response.body).toBe('ok');
+
+    // Cleanup ran exactly once
+    expect(appCounters.cleanupCount).toBe(1);
+  }, 10000);
+
+  it('should not re-listen or allow traffic after close() completed', async () => {
+    app = await NestFactory.create<NestFastifyApplication>(
+      AppModule,
+      new FastifyAdapter({ return503OnClosing: true }),
+      {
+        logger: false,
+      },
+    );
+    await app.listen(0);
+    const port = app.getHttpServer().address().port;
+
+    await app.close();
+    await expect(app.close()).resolves.toBeUndefined();
+
+    // The server is not listening anymore and no traffic is allowed through
+    await expect(request(port, '/slow')).rejects.toThrow();
+  }, 10000);
+
+  it('should serve requests and echoes normally when the option is not enabled', async () => {
+    resetAppCounters();
+
+    app = await NestFactory.create<NestFastifyApplication>(
+      AppModule,
+      new FastifyAdapter(),
+      {
+        logger: false,
+      },
+    );
+    await app.listen(0);
+    const port = app.getHttpServer().address().port;
+
+    const slow = await request(port, '/slow?delay=50');
+    expect(slow.status).toBe(200);
+    expect(slow.body).toBe('ok');
+
+    const echoed = await new Promise<RawResponse>((resolve, reject) => {
+      const body = JSON.stringify({ hello: 'world' });
+      const req = http.request(
+        `http://localhost:${port}/echo`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(body),
+            Connection: 'close',
+          },
+        },
+        res => {
+          let data = '';
+          res.on('data', chunk => (data += chunk));
+          res.on('end', () =>
+            resolve({
+              status: res.statusCode || 0,
+              headers: res.headers,
+              body: data,
+            }),
+          );
+        },
+      );
+      req.on('error', reject);
+      req.end(body);
+    });
+    expect(echoed.status).toBe(201);
+    expect(JSON.parse(echoed.body)).toEqual({ hello: 'world' });
+    expect(appCounters.echoCount).toBe(1);
   }, 10000);
 });

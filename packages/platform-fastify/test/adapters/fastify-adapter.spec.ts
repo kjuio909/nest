@@ -271,4 +271,60 @@ describe('FastifyAdapter', () => {
       await expect(fastifyAdapter.close()).resolves.toBeUndefined();
     });
   });
+
+  describe('closing request gate', () => {
+    const getRequestListeners = (adapter: FastifyAdapter) =>
+      (adapter.getHttpServer() as import('http').Server).listeners('request');
+
+    it('should not be installed by default', () => {
+      fastifyAdapter.initHttpServer({});
+
+      const listeners = getRequestListeners(fastifyAdapter);
+      expect(listeners).toHaveLength(1);
+      expect(listeners[0]).toBe(fastifyAdapter.getInstance().routing);
+    });
+
+    it('should be installed via the application option', () => {
+      fastifyAdapter.initHttpServer({ return503OnClosing: true });
+
+      const listeners = getRequestListeners(fastifyAdapter);
+      expect(listeners).toHaveLength(1);
+      expect(listeners[0]).not.toBe(fastifyAdapter.getInstance().routing);
+    });
+
+    it('should be installed via the adapter constructor option', () => {
+      const adapter = new FastifyAdapter({ return503OnClosing: true });
+      adapter.initHttpServer();
+
+      const listeners = getRequestListeners(adapter);
+      expect(listeners).toHaveLength(1);
+      expect(listeners[0]).not.toBe(adapter.getInstance().routing);
+    });
+
+    it('should reject requests with 503 once the shutdown started', async () => {
+      const adapter = new FastifyAdapter({ return503OnClosing: true });
+      adapter.initHttpServer();
+      adapter.beforeClose();
+
+      const server = adapter.getHttpServer() as import('http').Server;
+      const [listener] = getRequestListeners(adapter);
+
+      const end = vi.fn();
+      const res = {
+        setHeader: vi.fn(),
+        writeHead: vi.fn(),
+        end,
+      };
+      listener({ httpVersionMajor: 1 } as any, res as any);
+
+      expect(res.setHeader).toHaveBeenCalledWith('Connection', 'close');
+      expect(res.writeHead).toHaveBeenCalledWith(503, {
+        'Content-Type': 'text/plain',
+      });
+      expect(end).toHaveBeenCalledWith('Service Unavailable');
+
+      await adapter.close();
+      expect(server.listening).toBe(false);
+    });
+  });
 });
