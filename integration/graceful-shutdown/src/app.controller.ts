@@ -1,4 +1,5 @@
 import { Body, Controller, Get, Post, Query } from '@nestjs/common';
+import { wsCounters } from './graceful-ws.gateway.js';
 
 /**
  * Mutable counters so that e2e tests can observe how far requests travelled
@@ -80,5 +81,15 @@ export class AppController {
       appCounters.echoCount++;
     }
     return body;
+  }
+
+  /**
+   * Read-only view of the "/graceful-ws" probe counters. Exposed as an HTTP
+   * route while the app is running; after close() the same counter object
+   * remains readable in-process (see "wsCounters").
+   */
+  @Get('graceful-ws/stats')
+  gracefulWsStats() {
+    return { ...wsCounters };
   }
 }

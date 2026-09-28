@@ -326,5 +326,79 @@ describe('FastifyAdapter', () => {
       await adapter.close();
       expect(server.listening).toBe(false);
     });
+
+    it('should leave the upgrade event untouched when the gate is off', () => {
+      fastifyAdapter.initHttpServer({});
+      const server = fastifyAdapter.getHttpServer() as import('http').Server;
+      const emit = server.emit;
+      const listener = vi.fn();
+      server.on('upgrade', listener);
+
+      server.emit('upgrade', { httpVersion: '1.1' }, { destroyed: false }, Buffer.alloc(0));
+
+      expect(listener).toHaveBeenCalledTimes(1);
+      server.emit = emit;
+    });
+
+    it('should forward upgrades to listeners before the shutdown started', () => {
+      const adapter = new FastifyAdapter({ return503OnClosing: true });
+      adapter.initHttpServer();
+
+      const server = adapter.getHttpServer() as import('http').Server;
+      const listener = vi.fn();
+      server.on('upgrade', listener);
+
+      server.emit(
+        'upgrade',
+        { httpVersion: '1.1' },
+        {
+          destroyed: false,
+          writableEnded: false,
+          on() {},
+        },
+        Buffer.alloc(0),
+      );
+
+      expect(listener).toHaveBeenCalledTimes(1);
+    });
+
+    it('should reject upgrades with 503 once the shutdown started, without invoking listeners', async () => {
+      const adapter = new FastifyAdapter({ return503OnClosing: true });
+      adapter.initHttpServer();
+
+      const server = adapter.getHttpServer() as import('http').Server;
+      const listener = vi.fn();
+      server.on('upgrade', listener);
+
+      adapter.beforeClose();
+
+      const write = vi.fn();
+      const end = vi.fn();
+      const socket = {
+        destroyed: false,
+        writableEnded: false,
+        on: vi.fn(),
+        write,
+        end,
+        destroySoon: vi.fn(),
+      };
+      const result = server.emit(
+        'upgrade',
+        { httpVersion: '1.1' },
+        socket as any,
+        Buffer.alloc(0),
+      );
+
+      expect(listener).not.toHaveBeenCalled();
+      // Node treats a truthy emit result as "a listener handled the event".
+      expect(result).toBe(true);
+      const rawResponse = write.mock.calls[0][0] as string;
+      expect(rawResponse).toContain('HTTP/1.1 503 Service Unavailable');
+      expect(rawResponse.toLowerCase()).toContain('connection: close');
+      expect(rawResponse).toContain('Service Unavailable');
+      expect(end).toHaveBeenCalled();
+
+      await adapter.close();
+    });
   });
 });

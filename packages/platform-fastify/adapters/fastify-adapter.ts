@@ -41,6 +41,8 @@ import fastifySymbols from 'fastify/lib/symbols.js';
 import * as http from 'http';
 import * as http2 from 'http2';
 import * as https from 'https';
+import * as net from 'net';
+import type { Duplex } from 'stream';
 import {
   InjectOptions,
   Chain as LightMyRequestChain,
@@ -178,6 +180,7 @@ export class FastifyAdapter<
   private isShuttingDown = false;
   private closePromise?: Promise<void>;
   private return503OnClosing = false;
+  private closingGateInstalled = false;
   private readonly versionConstraint = {
     name: 'version',
     validate(value: unknown) {
@@ -866,7 +869,7 @@ export class FastifyAdapter<
    * (middleware, guards, pipes, interceptors, handlers), while requests
    * that were already accepted run to completion.
    *
-   * The gate has two layers:
+   * The gate has three layers:
    *
    * - a wrapper around the server's "request" listener, which rejects every
    *   request whose headers arrive after the shutdown started — including
@@ -883,9 +886,22 @@ export class FastifyAdapter<
    *   hooks after the request body has been fully received and right before
    *   the route handler (where the Nest pipeline begins), so a late
    *   rejection here still happens before any guard, pipe, interceptor or
-   *   controller runs and cannot trigger business side effects.
+   *   controller runs and cannot trigger business side effects;
+   * - a wrapper around the server's "upgrade" event emission, which rejects
+   *   upgrades whose handshake arrives after the shutdown started — including
+   *   upgrades attempted on a reused keep-alive connection — with the very
+   *   same 503 response, while sockets of upgrades accepted earlier are
+   *   tracked and drained by "beforeClose()" so established WebSocket
+   *   connections can finish their in-flight work.
    */
   private installClosingRequestGate() {
+    // Idempotent: initHttpServer() must be safe to run more than once, and the
+    // listeners below (especially the "emit" wrapper) cannot be stacked.
+    if (this.closingGateInstalled) {
+      return;
+    }
+    this.closingGateInstalled = true;
+
     const server = this.httpServer as unknown as http.Server;
     const routing = this.instance.routing;
     server.removeListener('request', routing);
@@ -917,6 +933,69 @@ export class FastifyAdapter<
         .header('Content-Type', 'text/plain')
         .send('Service Unavailable');
     });
+
+    this.installClosingUpgradeGate(server);
+  }
+
+  /**
+   * Intercepts the server's "upgrade" event at its source (the emitter) so
+   * that every upgrade observed after the shutdown state was established is
+   * answered with "503 Service Unavailable", a "Connection: close" header and
+   * a plain-text body, after which the socket is closed. The event never
+   * reaches the registered WebSocket servers or any business gateway/message
+   * handler, and the rejected socket is not tracked as a connection.
+   *
+   * Upgrades observed before the shutdown started pass through unchanged.
+   * Their sockets stay owned by the registered WebSocket machinery, and
+   * Node's own "server.close()" (invoked by "fastify.close()") already keeps
+   * the server alive until those connections end, which lets established
+   * connections finish their in-flight work during shutdown.
+   *
+   * Intercepting "emit" rather than wrapping "addListener"/"on" keeps the
+   * rejection effective no matter how the upgrade listener was attached (the
+   * "@nestjs/platform-ws" adapter uses "server.on()", but user code and
+   * third-party libraries may register listeners directly) and guarantees it
+   * runs strictly before any listener.
+   */
+  private installClosingUpgradeGate(server: http.Server) {
+    const originalEmit = server.emit.bind(server) as (
+      event: string,
+      ...args: any[]
+    ) => boolean;
+    server.emit = (event: string, ...args: any[]) => {
+      if (event !== 'upgrade' || !this.isShuttingDown) {
+        return originalEmit(event, ...args);
+      }
+      const [request, socket] = args as [http.IncomingMessage, Duplex];
+      return this.rejectUpgrade(request, socket);
+    };
+  }
+
+  private rejectUpgrade(request: http.IncomingMessage, socket: Duplex) {
+    // Mirrors the request gate's rejection contract. The reason phrase is
+    // emitted explicitly because "http.ServerResponse" is not involved here:
+    // the upgrade hands us the raw net socket.
+    const body = 'Service Unavailable';
+    // Node detaches an upgraded socket from the server's own error handling,
+    // so a client RST right after the rejection would otherwise surface as an
+    // unhandled 'error' and crash the process.
+    socket.on('error', () => {});
+    if (!socket.destroyed && !socket.writableEnded) {
+      socket.write(
+        `HTTP/${request.httpVersion ?? '1.1'} 503 Service Unavailable\r\n` +
+          'Content-Type: text/plain\r\n' +
+          'Connection: close\r\n' +
+          `Content-Length: ${Buffer.byteLength(body)}\r\n` +
+          '\r\n' +
+          body,
+      );
+      // Flush gracefully (FIN), then make sure a client that keeps its side
+      // open cannot pin the socket anyway.
+      socket.end();
+      (socket as unknown as net.Socket).destroySoon?.();
+    }
+    // Node treats a truthy return from "emit" as "there was a listener".
+    return true;
   }
 
   private registerJsonContentParser(rawBody?: boolean) {
