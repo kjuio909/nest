@@ -319,4 +319,66 @@ describe('NestApplication', () => {
       expect((instance as any).config.getIoAdapter()).toBe(adapter);
     });
   });
+
+  describe('shutdown', () => {
+    function createInstance() {
+      class CountingHttpAdapter extends NoopHttpAdapter {
+        public beforeCloseCalls = 0;
+        public closeCalls = 0;
+        public beforeClose() {
+          this.beforeCloseCalls++;
+        }
+        public close() {
+          this.closeCalls++;
+        }
+      }
+
+      const noopHttpAdapter = new CountingHttpAdapter({});
+      const applicationConfig = new ApplicationConfig();
+      const container = new NestContainer(applicationConfig);
+      container.setHttpAdapter(noopHttpAdapter);
+      const instance = new NestApplication(
+        container,
+        noopHttpAdapter,
+        applicationConfig,
+        new GraphInspector(container),
+        {},
+      );
+      return { instance, noopHttpAdapter };
+    }
+
+    it('should run the shutdown sequence only once across concurrent and repeated close() calls', async () => {
+      const { instance, noopHttpAdapter } = createInstance();
+      const destroyHookStub = vi
+        .spyOn(instance as any, 'callDestroyHook')
+        .mockResolvedValue(undefined);
+
+      await Promise.all([instance.close(), instance.close()]);
+      await instance.close();
+      await instance.close();
+
+      expect(destroyHookStub).toHaveBeenCalledTimes(1);
+      expect(noopHttpAdapter.beforeCloseCalls).toBe(1);
+      expect(noopHttpAdapter.closeCalls).toBe(1);
+
+      destroyHookStub.mockRestore();
+    });
+
+    it('should allow retrying close() when a previous shutdown cycle failed', async () => {
+      const { instance, noopHttpAdapter } = createInstance();
+      const destroyHookStub = vi
+        .spyOn(instance as any, 'callDestroyHook')
+        .mockRejectedValueOnce(new Error('boom'))
+        .mockResolvedValue(undefined);
+
+      await expect(instance.close()).rejects.toThrow('boom');
+      await expect(instance.close()).resolves.toBeUndefined();
+
+      expect(destroyHookStub).toHaveBeenCalledTimes(2);
+      expect(noopHttpAdapter.beforeCloseCalls).toBe(2);
+      expect(noopHttpAdapter.closeCalls).toBe(1);
+
+      destroyHookStub.mockRestore();
+    });
+  });
 });

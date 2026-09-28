@@ -74,9 +74,21 @@ describe('Graceful Shutdown (Express)', () => {
     await new Promise(r => setTimeout(r, 0));
 
     // 4. Send Request B immediately using the same agent.
-    const statusPromise = new Promise<number>((resolve, reject) => {
+    const responsePromise = new Promise<{
+      status: number;
+      body: string;
+      connection?: string;
+    }>((resolve, reject) => {
       const req = http.get(`http://localhost:${port}/slow`, { agent }, res => {
-        resolve(res.statusCode || 0);
+        let data = '';
+        res.on('data', chunk => (data += chunk));
+        res.on('end', () =>
+          resolve({
+            status: res.statusCode || 0,
+            body: data,
+            connection: res.headers['connection'],
+          }),
+        );
       });
       req.on('error', reject);
     });
@@ -84,8 +96,10 @@ describe('Graceful Shutdown (Express)', () => {
     // 5. Cleanup Request A
     req1.on('error', () => {});
 
-    const status = await statusPromise;
-    expect(status).toBe(503);
+    const response = await responsePromise;
+    expect(response.status).toBe(503);
+    expect(response.body).toBe('Service Unavailable');
+    expect(response.connection).toBe('close');
 
     await closePromise;
     agent.destroy();

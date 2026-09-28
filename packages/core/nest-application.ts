@@ -63,6 +63,16 @@ export class NestApplication
   private httpServer: any;
   private isListening = false;
   private isWsModuleRegistered = false;
+  /**
+   * The single teardown cycle of an HTTP application. Unlike a plain
+   * application context, a web application cannot be shut down twice: once
+   * `close()` has run, the server has stopped listening and the lifecycle
+   * hooks (`onModuleDestroy`/`onApplicationShutdown`) must not run again.
+   * Concurrent and repeated calls — including ones that arrive after a
+   * previous cycle has settled — await the very same promise, so cleanup
+   * executes exactly once and the shutdown request gate is never reopened.
+   */
+  private applicationShutdownPromise?: Promise<void>;
 
   constructor(
     container: NestContainer,
@@ -92,6 +102,33 @@ export class NestApplication
 
   protected async prepareClose(): Promise<void> {
     this.httpAdapter && (await this.httpAdapter.beforeClose?.());
+  }
+
+  /**
+   * Runs the HTTP application's single shutdown sequence. Once a cycle has
+   * completed successfully, every later caller (a repeated `close()`, a
+   * second process signal) awaits the very same result instead of starting a
+   * new cycle: teardown — the request gate, the native server close and the
+   * lifecycle hooks — therefore runs exactly once, the gate is never
+   * reopened and no new traffic can pass afterwards. Callers arriving while a
+   * cycle is still in flight share that cycle too. A cycle that rejects is
+   * not latched, mirroring the application-context behavior, so a failed
+   * shutdown can still be retried.
+   */
+  protected shutdown(signal?: string): Promise<void> {
+    if (this.applicationShutdownPromise) {
+      return this.applicationShutdownPromise;
+    }
+    const shutdownPromise = super.shutdown(signal);
+    this.applicationShutdownPromise = shutdownPromise.then(
+      () => undefined,
+      err => {
+        // Only a settled shutdown is final; a failed one may be retried
+        this.applicationShutdownPromise = undefined;
+        throw err;
+      },
+    );
+    return this.applicationShutdownPromise;
   }
 
   protected async dispose(): Promise<void> {

@@ -335,7 +335,7 @@ export class ExpressAdapter extends AbstractHttpAdapter<
       this.instance.use((req: any, res: any, next: any) => {
         if (this.isShuttingDown) {
           res.set('Connection', 'close');
-          res.status(503).send('Service Unavailable');
+          res.type('text/plain').status(503).send('Service Unavailable');
         } else {
           next();
         }
