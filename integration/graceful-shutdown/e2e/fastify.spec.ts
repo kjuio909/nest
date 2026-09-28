@@ -58,6 +58,40 @@ const request = (
       .on('error', reject);
   });
 
+const post = (
+  port: number,
+  path: string,
+  body: string,
+  agent?: http.Agent,
+): Promise<RawResponse> =>
+  new Promise<RawResponse>((resolve, reject) => {
+    const req = http.request(
+      `http://localhost:${port}${path}`,
+      {
+        method: 'POST',
+        agent,
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+          ...(agent ? {} : { Connection: 'close' }),
+        },
+      },
+      res => {
+        let data = '';
+        res.on('data', chunk => (data += chunk));
+        res.on('end', () =>
+          resolve({
+            status: res.statusCode || 0,
+            headers: res.headers,
+            body: data,
+          }),
+        );
+      },
+    );
+    req.on('error', reject);
+    req.end(body);
+  });
+
 const counters = {
   guard: 0,
   pipe: 0,
@@ -523,4 +557,195 @@ describe('Graceful Shutdown (Fastify)', () => {
     expect(JSON.parse(echoed.body)).toEqual({ hello: 'world' });
     expect(appCounters.echoCount).toBe(1);
   }, 10000);
+
+  describe('/graceful-probe', () => {
+    const createApp = async (
+      options: { viaAdapter?: boolean } = {},
+    ): Promise<{ app: INestApplication; port: number }> => {
+      app = await NestFactory.create<NestFastifyApplication>(
+        AppModule,
+        options.viaAdapter
+          ? new FastifyAdapter({ return503OnClosing: true })
+          : new FastifyAdapter(),
+        {
+          return503OnClosing: options.viaAdapter ? undefined : true,
+          logger: false,
+        },
+      );
+      await app.listen(0);
+      return { app, port: app.getHttpServer().address().port };
+    };
+
+    it('slow mode succeeds after the delay and counts the handler entry', async () => {
+      resetAppCounters();
+      const { port } = await createApp();
+
+      const started = Date.now();
+      const response = await request(port, '/graceful-probe?mode=slow&delay=100');
+      expect(Date.now() - started).toBeGreaterThanOrEqual(80);
+      expect(response.status).toBe(200);
+      expect(response.body).toBe('ok');
+      expect(appCounters.handlerEntries).toBe(1);
+      expect(appCounters.echoCount).toBe(0);
+    }, 10000);
+
+    it('error mode preserves the original status and body after the delay', async () => {
+      resetAppCounters();
+      const { port } = await createApp();
+
+      const response = await request(
+        port,
+        '/graceful-probe?mode=error&delay=50',
+      );
+      expect(response.status).toBe(500);
+      expect(response.body).toContain('Internal server error');
+      // The failed request still entered the handler once and is not rolled back
+      expect(appCounters.handlerEntries).toBe(1);
+    }, 10000);
+
+    it('stats mode reports handler, body and cleanup counters without side effects', async () => {
+      resetAppCounters();
+      const { port } = await createApp();
+
+      await request(port, '/graceful-probe?mode=slow&delay=10');
+      const body = JSON.stringify({ hello: 'world' });
+      const echoed = await post(port, '/graceful-probe?mode=echo', body);
+      expect(echoed.status).toBe(201);
+      expect(JSON.parse(echoed.body)).toEqual({ hello: 'world' });
+
+      const stats = await request(port, '/graceful-probe?mode=stats');
+      expect(stats.status).toBe(200);
+      expect(JSON.parse(stats.body)).toEqual({
+        handlerEntries: 2,
+        echoCount: 1,
+        cleanupCount: 0,
+      });
+    }, 10000);
+
+    it('echo mode counts the full body only once and echoes its content', async () => {
+      resetAppCounters();
+      const { port } = await createApp();
+
+      const echoed = await post(
+        port,
+        '/graceful-probe?mode=echo',
+        JSON.stringify({ a: 1, b: [2, 3] }),
+      );
+      expect(echoed.status).toBe(201);
+      expect(JSON.parse(echoed.body)).toEqual({ a: 1, b: [2, 3] });
+      expect(appCounters.handlerEntries).toBe(1);
+      expect(appCounters.echoCount).toBe(1);
+    }, 10000);
+
+    it('lets an in-flight slow probe finish when close() is called meanwhile', async () => {
+      resetAppCounters();
+      const { port } = await createApp();
+
+      const requestPromise = request(
+        port,
+        '/graceful-probe?mode=slow&delay=300',
+      );
+      await new Promise(r => setTimeout(r, 100));
+
+      const closePromise = app.close();
+      const response = await requestPromise;
+      expect(response.status).toBe(200);
+      expect(response.body).toBe('ok');
+      await closePromise;
+
+      // The completed business work is not rolled back
+      expect(appCounters.handlerEntries).toBe(1);
+    }, 10000);
+
+    it('exposes the final counters and cleanup-once after close completed', async () => {
+      resetAppCounters();
+      const { port } = await createApp();
+
+      await request(port, '/graceful-probe?mode=slow&delay=10');
+      await post(port, '/graceful-probe?mode=echo', JSON.stringify({ x: 1 }));
+
+      await app.close();
+      // Repeated (sequential) closes are no-ops: cleanup runs exactly once
+      await app.close();
+
+      expect(appCounters.handlerEntries).toBe(2);
+      expect(appCounters.echoCount).toBe(1);
+      expect(appCounters.cleanupCount).toBe(1);
+
+      // The instance cannot receive requests anymore
+      await expect(request(port, '/graceful-probe?mode=stats')).rejects.toThrow();
+    }, 10000);
+
+    it('rejects a partial-body probe after shutdown without polluting counters', async () => {
+      resetAppCounters();
+      const { port } = await createApp({ viaAdapter: true });
+
+      const socket = net.createConnection(port, '127.0.0.1');
+      socket.on('error', () => {});
+      await new Promise<void>(resolve => socket.once('connect', resolve));
+
+      const body = JSON.stringify({ hello: 'world' });
+      socket.write(
+        `POST /graceful-probe?mode=echo HTTP/1.1\r\nHost: localhost:${port}\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n`,
+      );
+      socket.write(body.slice(0, 5));
+      await new Promise(r => setTimeout(r, 50));
+
+      const closePromise = app.close();
+      await new Promise(r => setTimeout(r, 50));
+
+      socket.write(body.slice(5));
+
+      const rawResponse = await new Promise<string>(resolve => {
+        let data = '';
+        socket.on('data', chunk => (data += chunk));
+        socket.on('end', () => resolve(data));
+      });
+      expect(rawResponse).toContain(' 503 ');
+      expect(rawResponse.toLowerCase()).toContain('connection: close');
+      expect(rawResponse).toContain('Service Unavailable');
+
+      await closePromise;
+
+      // Late body bytes never reached the business pipeline
+      expect(appCounters.handlerEntries).toBe(0);
+      expect(appCounters.echoCount).toBe(0);
+      expect(appCounters.cleanupCount).toBe(1);
+
+      socket.destroy();
+    }, 10000);
+
+    it('behaves identically when the gate is enabled via either option surface', async () => {
+      resetAppCounters();
+      const { port } = await createApp({ viaAdapter: true });
+
+      const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+      const requestA = request(
+        port,
+        '/graceful-probe?mode=slow&delay=300',
+        agent,
+      );
+      await new Promise(r => setTimeout(r, 100));
+
+      const closePromise = app.close();
+      await new Promise(r => setTimeout(r, 0));
+
+      const requestB = request(port, '/graceful-probe?mode=stats', agent);
+
+      const responseA = await requestA;
+      expect(responseA.status).toBe(200);
+      expect(responseA.body).toBe('ok');
+
+      const responseB = await requestB;
+      expect(responseB.status).toBe(503);
+      expect(responseB.body).toBe('Service Unavailable');
+      expect(responseB.headers['connection']).toBe('close');
+
+      await closePromise;
+      agent.destroy();
+
+      expect(appCounters.handlerEntries).toBe(1);
+      expect(appCounters.cleanupCount).toBe(1);
+    }, 10000);
+  });
 });

@@ -63,6 +63,42 @@ export class NestApplication
   private httpServer: any;
   private isListening = false;
   private isWsModuleRegistered = false;
+  /**
+   * Whether a shutdown cycle has completed successfully. Afterwards the
+   * closed instance cannot accept traffic anymore, so further "close()"
+   * calls are no-ops instead of running the destroy/shutdown lifecycle hooks
+   * (and cleanup) a second time.
+   */
+  private isClosed = false;
+  /**
+   * The shutdown cycle currently in flight, if any. Concurrent "close()"
+   * callers await this very promise instead of starting a second teardown.
+   */
+  private activeClosePromise?: Promise<void>;
+
+  /**
+   * Runs the shutdown sequence behind "close()" (and the process signal
+   * handlers). Concurrent calls share the first shutdown cycle, and once it
+   * completed successfully further calls are no-ops: a closed instance
+   * cannot serve traffic again, so the destroy/shutdown lifecycle hooks
+   * (and their cleanup) must not run a second time. A shutdown that
+   * rejected does not latch the guard, leaving the usual retry semantics
+   * intact.
+   */
+  protected shutdown(signal?: string): Promise<void> {
+    if (this.isClosed) {
+      return Promise.resolve();
+    }
+    this.activeClosePromise ??= super
+      .shutdown(signal)
+      .then(() => {
+        this.isClosed = true;
+      })
+      .finally(() => {
+        this.activeClosePromise = undefined;
+      });
+    return this.activeClosePromise;
+  }
 
   constructor(
     container: NestContainer,

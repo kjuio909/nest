@@ -319,4 +319,43 @@ describe('NestApplication', () => {
       expect((instance as any).config.getIoAdapter()).toBe(adapter);
     });
   });
+
+  describe('close', () => {
+    function createInstanceWithClose(closeImpl: () => any) {
+      const applicationConfig = new ApplicationConfig();
+      const container = new NestContainer(applicationConfig);
+      const adapter = new NoopHttpAdapter({});
+      adapter.close = closeImpl as any;
+      return new NestApplication(
+        container,
+        adapter,
+        applicationConfig,
+        new GraphInspector(container),
+        {},
+      );
+    }
+
+    it('runs the teardown only once across concurrent and repeated close() calls', async () => {
+      const closeSpy = vi.fn();
+      const instance = createInstanceWithClose(closeSpy);
+
+      await Promise.all([instance.close(), instance.close()]);
+      await instance.close();
+
+      expect(closeSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not latch when the shutdown sequence fails', async () => {
+      const closeSpy = vi
+        .fn()
+        .mockRejectedValueOnce(new Error('boom'))
+        .mockResolvedValue(undefined);
+      const instance = createInstanceWithClose(closeSpy);
+
+      await expect(instance.close()).rejects.toThrow('boom');
+      await instance.close();
+
+      expect(closeSpy).toHaveBeenCalledTimes(2);
+    });
+  });
 });

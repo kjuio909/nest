@@ -45,4 +45,40 @@ export class AppController {
     appCounters.echoCount++;
     return body;
   }
+
+  /**
+   * Single endpoint bundling the probe behaviors the shutdown gate can be
+   * observed through, independent of the route shape:
+   * - GET  ?mode=slow   resolves with "ok" after "delay" ms (default 500)
+   * - GET  ?mode=error  throws a business error after "delay" ms
+   * - GET  ?mode=stats  reports the shared counters without disturbing them
+   * - POST ?mode=echo   increments the counters only once the full body was
+   *                     received and echoes the parsed body back
+   */
+  @Get('graceful-probe')
+  async gracefulProbe(
+    @Query('mode') mode?: string,
+    @Query('delay') delay?: string,
+  ) {
+    if (mode === 'stats') {
+      return { ...appCounters };
+    }
+    appCounters.handlerEntries++;
+    const ms = delay === undefined ? 500 : Number(delay);
+    await new Promise(resolve => setTimeout(resolve, ms));
+    if (mode === 'error') {
+      throw new Error('boom');
+    }
+    return 'ok';
+  }
+
+  @Post('graceful-probe')
+  gracefulProbeEcho(@Query('mode') mode: string, @Body() body: unknown) {
+    // Only reached once the request body has been fully received and parsed
+    appCounters.handlerEntries++;
+    if (mode === 'echo') {
+      appCounters.echoCount++;
+    }
+    return body;
+  }
 }
