@@ -26,6 +26,7 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { HttpAdapterHost } from '@nestjs/core';
+import { createInvalidBatchIdBody } from './batch-raw-url.gate.js';
 
 /**
  * Per-process counters used by the request-isolation suites. The aggregation
@@ -160,14 +161,7 @@ function parseBatchValue(raw: unknown): number | null {
 // aggregated message array of the annotated route.
 class InvalidBatchIdException extends HttpException {
   constructor() {
-    super(
-      {
-        statusCode: HttpStatus.BAD_REQUEST,
-        error: 'Bad Request',
-        message: 'ID',
-      },
-      HttpStatus.BAD_REQUEST,
-    );
+    super(createInvalidBatchIdBody(), HttpStatus.BAD_REQUEST);
   }
 }
 
