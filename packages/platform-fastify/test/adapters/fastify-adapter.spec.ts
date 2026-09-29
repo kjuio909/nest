@@ -326,5 +326,73 @@ describe('FastifyAdapter', () => {
       await adapter.close();
       expect(server.listening).toBe(false);
     });
+
+    it('should forward upgrades to listeners while the app is running', async () => {
+      const adapter = new FastifyAdapter({ return503OnClosing: true });
+      adapter.initHttpServer();
+
+      const server = adapter.getHttpServer() as import('http').Server;
+      const upgradeListener = vi.fn();
+      server.on('upgrade', upgradeListener);
+
+      const socket = { writable: true, once: vi.fn(), end: vi.fn() };
+      server.emit(
+        'upgrade',
+        { url: '/graceful-ws' },
+        socket as any,
+        Buffer.alloc(0),
+      );
+
+      expect(upgradeListener).toHaveBeenCalledTimes(1);
+      expect(socket.end).not.toHaveBeenCalled();
+
+      await adapter.close();
+    });
+
+    it('should reject upgrades with 503 once the shutdown started', async () => {
+      const adapter = new FastifyAdapter({ return503OnClosing: true });
+      adapter.initHttpServer();
+      adapter.beforeClose();
+
+      const server = adapter.getHttpServer() as import('http').Server;
+      const upgradeListener = vi.fn();
+      server.on('upgrade', upgradeListener);
+
+      const end = vi.fn();
+      const socket = { writable: true, once: vi.fn(), end, destroy: vi.fn() };
+      server.emit(
+        'upgrade',
+        { url: '/graceful-ws' },
+        socket as any,
+        Buffer.alloc(0),
+      );
+
+      expect(upgradeListener).not.toHaveBeenCalled();
+      const response = end.mock.calls[0][0] as string;
+      expect(response).toContain('HTTP/1.1 503 Service Unavailable');
+      expect(response).toContain('Connection: close');
+      expect(response).toContain('Content-Type: text/plain');
+      expect(response).toContain('Service Unavailable');
+
+      await adapter.close();
+    });
+
+    it('should not install the upgrade gate when the option is disabled', () => {
+      fastifyAdapter.initHttpServer({});
+
+      const server = fastifyAdapter.getHttpServer() as import('http').Server;
+      const upgradeListener = vi.fn();
+      server.on('upgrade', upgradeListener);
+
+      const socket = { writable: true, once: vi.fn(), end: vi.fn() };
+      server.emit(
+        'upgrade',
+        { url: '/graceful-ws' },
+        socket as any,
+        Buffer.alloc(0),
+      );
+
+      expect(upgradeListener).toHaveBeenCalledTimes(1);
+    });
   });
 });

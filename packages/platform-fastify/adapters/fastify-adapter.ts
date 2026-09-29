@@ -41,6 +41,7 @@ import fastifySymbols from 'fastify/lib/symbols.js';
 import * as http from 'http';
 import * as http2 from 'http2';
 import * as https from 'https';
+import * as net from 'net';
 import {
   InjectOptions,
   Chain as LightMyRequestChain,
@@ -178,6 +179,7 @@ export class FastifyAdapter<
   private isShuttingDown = false;
   private closePromise?: Promise<void>;
   private return503OnClosing = false;
+  private isClosingUpgradeGateInstalled = false;
   private readonly versionConstraint = {
     name: 'version',
     validate(value: unknown) {
@@ -291,8 +293,8 @@ export class FastifyAdapter<
     // forwarded untouched; the adapter only records it here so that
     // "initHttpServer" installs its own (Express-compatible) request gate
     // even when no application-level "return503OnClosing" option is set.
-    this.return503OnClosing =
-      !!(instanceOrOptions as FastifyAdapterBaseOptions)?.return503OnClosing;
+    this.return503OnClosing = !!(instanceOrOptions as FastifyAdapterBaseOptions)
+      ?.return503OnClosing;
 
     this.instance.addHook('onRequest', (request, reply, done) => {
       if (this.onRequestHook) {
@@ -917,6 +919,72 @@ export class FastifyAdapter<
         .header('Content-Type', 'text/plain')
         .send('Service Unavailable');
     });
+
+    this.installClosingUpgradeGate();
+  }
+
+  /**
+   * Installs an upgrade gate in front of every registered "upgrade" listener
+   * (e.g. a "noServer" WebSocketServer) so that handshakes observed only after
+   * the shutdown started are rejected at the HTTP layer, before the gateway
+   * or any message handling can run: a plain "503 Service Unavailable"
+   * response with "Connection: close", followed by socket termination.
+   *
+   * Upgrades observed while the application is still running - including ones
+   * whose handshake bytes are still arriving when the shutdown begins - are
+   * forwarded to the listeners registered at upgrade time, so already
+   * accepted connections keep their existing error semantics and in-flight
+   * work can drain. The server's "emit" is wrapped instead of registering an
+   * "upgrade" listener so that listeners registered later (plugins attach
+   * during application initialization, after the adapter) are covered as
+   * well, and the gate stays the single interception point.
+   */
+  private installClosingUpgradeGate() {
+    if (this.isClosingUpgradeGateInstalled) {
+      return;
+    }
+    this.isClosingUpgradeGateInstalled = true;
+
+    const server = this.httpServer as unknown as http.Server;
+    const originalEmit = server.emit.bind(server) as (
+      event: string,
+      ...args: any[]
+    ) => boolean;
+
+    server.emit = ((event: string, ...args: any[]) => {
+      if (event !== 'upgrade') {
+        return originalEmit(event, ...args);
+      }
+
+      const [request, socket, head] = args as [
+        http.IncomingMessage,
+        net.Socket,
+        Buffer,
+      ];
+      if (!this.isShuttingDown) {
+        return originalEmit('upgrade', request, socket, head);
+      }
+
+      // Reject the handshake at the HTTP layer without dispatching it to any
+      // upgrade listener (gateway/message handling never runs), then close the
+      // underlying connection so it cannot be reused for further requests.
+      if (!socket.writable) {
+        socket.destroy();
+        return false;
+      }
+      socket.once('error', () => socket.destroy());
+      socket.end(
+        [
+          'HTTP/1.1 503 Service Unavailable',
+          'Connection: close',
+          'Content-Type: text/plain',
+          'Content-Length: 19',
+          '',
+          'Service Unavailable',
+        ].join('\r\n'),
+      );
+      return false;
+    }) as typeof server.emit;
   }
 
   private registerJsonContentParser(rawBody?: boolean) {
