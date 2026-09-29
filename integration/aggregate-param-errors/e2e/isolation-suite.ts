@@ -807,6 +807,231 @@ export function registerIsolationSuite(deps: IsolationSuiteDeps): void {
       });
     });
 
+    describe('single percent-decoding boundary on the batch routes', () => {
+      // Both adapters expose identical query/path decoding: every value is
+      // percent-decoded exactly once, never a second time, and a malformed
+      // percent sequence is a per-position validation error rather than a
+      // parser crash. These cases pin the shared boundary.
+      it('treats a percent-encoded id as equivalent to its plaintext digits', async () => {
+        const ok = await request('GET', '/batch/%37?item=%32');
+        expect(ok.status).toBe(200);
+        expect(ok.body).toEqual({ id: 7, items: [2] });
+        expect(isolationState.pipeCalls).toEqual(['ID', 'ITEM']);
+      });
+
+      it('decodes encoded leading zeros and the encoded inclusive range boundary', async () => {
+        const leadingZeros = await request('GET', '/batch/%30%30?item=1');
+        expect(leadingZeros.status).toBe(200);
+        expect(leadingZeros.body).toEqual({ id: 0, items: [1] });
+
+        const boundary = await request(
+          'GET',
+          '/batch/%32%31%34%37%34%38%33%36%34%37?item=%30&item=%32%31%34%37%34%38%33%36%34%37',
+        );
+        expect(boundary.status).toBe(200);
+        expect(boundary.body).toEqual({
+          id: 2147483647,
+          items: [0, 2147483647],
+        });
+      });
+
+      it('rejects an encoded value above the range after decoding it once', async () => {
+        const failed = await request(
+          'GET',
+          '/batch/7?item=%32%31%34%37%34%38%33%36%34%38',
+        );
+        expect(failed.status).toBe(400);
+        expect(failed.body.message).toEqual(['ITEM[0]']);
+      });
+
+      it('keeps item appearance order stable across unrelated and encoded keys', async () => {
+        const ok = await request(
+          'GET',
+          '/batch/7?item=%32&tag=%78%3d%79&item=004&other=z&item=%39',
+        );
+        expect(ok.status).toBe(200);
+        expect(ok.body).toEqual({ id: 7, items: [2, 4, 9] });
+        expect(isolationState.handlerCalls.batch).toBe(1);
+        expect(isolationState.pipeCalls).toEqual([
+          'ID',
+          'ITEM',
+          'ITEM',
+          'ITEM',
+        ]);
+      });
+
+      it('keeps the single-value array shape for an encoded value', async () => {
+        const ok = await request('GET', '/batch/7?item=%34');
+        expect(ok.status).toBe(200);
+        expect(ok.body).toEqual({ id: 7, items: [4] });
+      });
+
+      it('does not treat a plus as a space: encoded and literal pluses are invalid elements', async () => {
+        for (const path of [
+          '/batch/7?item=+',
+          '/batch/7?item=%2b',
+          '/batch/7?item=%2B',
+          '/batch/7?item=1%2B2',
+          '/batch/7?item=%2b32',
+        ]) {
+          const failed = await request('GET', path);
+          expect(failed.status).toBe(400);
+          expect(failed.body.message).toEqual(['ITEM[0]']);
+        }
+        expect(isolationState.handlerCalls.batch ?? 0).toBe(0);
+      });
+
+      it('rejects decoded whitespace (literal or encoded) at its own position', async () => {
+        const encoded = await request('GET', '/batch/7?item=%20');
+        expect(encoded.status).toBe(400);
+        expect(encoded.body.message).toEqual(['ITEM[0]']);
+
+        const padded = await request('GET', '/batch/7?item=2%20&item=%34');
+        expect(padded.status).toBe(400);
+        expect(padded.body.message).toEqual(['ITEM[0]']);
+
+        // The encoded space keeps its position while the other elements are
+        // still inspected in order.
+        const positioned = await request(
+          'GET',
+          '/batch/7?item=2&item=%09&item=4',
+        );
+        expect(positioned.status).toBe(400);
+        expect(positioned.body.message).toEqual(['ITEM[1]']);
+      });
+
+      it('never decodes a second time: percent sequences appearing only after another decode are invalid', async () => {
+        const item = await request('GET', '/batch/7?item=%2532');
+        expect(item.status).toBe(400);
+        expect(item.body.message).toEqual(['ITEM[0]']);
+
+        const itemPrefix = await request('GET', '/batch/7?item=%2534');
+        expect(itemPrefix.status).toBe(400);
+        expect(itemPrefix.body.message).toEqual(['ITEM[0]']);
+
+        const id = await request('GET', '/batch/%2537?item=1');
+        expect(id.status).toBe(400);
+        expect(id.body).toEqual({
+          statusCode: 400,
+          error: 'Bad Request',
+          message: 'ID',
+        });
+      });
+
+      it('flags every malformed percent sequence at its original position without a parser 500', async () => {
+        const cases: Array<[string, string[]]> = [
+          ['/batch/7?item=%zz', ['ITEM[0]']],
+          ['/batch/7?item=%', ['ITEM[0]']],
+          ['/batch/7?item=%2', ['ITEM[0]']],
+          ['/batch/7?item=%zz&item=%2', ['ITEM[0]', 'ITEM[1]']],
+          ['/batch/7?item=2&item=%zz&item=4', ['ITEM[1]']],
+          ['/batch/7?item=%FE%FF', ['ITEM[0]']],
+          ['/batch/7?item=%E4%bd', ['ITEM[0]']],
+        ];
+        for (const [path, messages] of cases) {
+          const failed = await request('GET', path);
+          expect(failed.status).toBe(400);
+          expect(failed.status).not.toBe(500);
+          expect(failed.body.message).toEqual(messages);
+        }
+        expect(isolationState.handlerCalls.batch ?? 0).toBe(0);
+      });
+
+      it('treats every malformed percent sequence in the id segment as the plain ID 400 before inspecting items', async () => {
+        for (const path of [
+          '/batch/%zz?item=1',
+          '/batch/%?item=1',
+          '/batch/%2?item=1',
+          '/batch/%7?item=1',
+          '/batch/%FE%FF?item=1',
+          '/batch-plain/%zz?item=1',
+          '/batch-plain/%FE%FF?item=1',
+        ]) {
+          const failed = await request('GET', path);
+          expect(failed.status).toBe(400);
+          expect(failed.status).not.toBe(500);
+          expect(failed.body).toEqual({
+            statusCode: 400,
+            error: 'Bad Request',
+            message: 'ID',
+          });
+        }
+        // The guard aborts before routing, so no item was ever inspected.
+        expect(isolationState.pipeCalls.filter(t => t === 'ITEM')).toHaveLength(
+          0,
+        );
+        expect(isolationState.handlerCalls.batch ?? 0).toBe(0);
+        expect(isolationState.handlerCalls.batchPlain ?? 0).toBe(0);
+      });
+
+      it('keeps other non-numeric decoded id segments on the plain ID 400', async () => {
+        for (const path of [
+          '/batch/%2f?item=1',
+          '/batch/%41?item=1',
+          '/batch/%7a%7a?item=1',
+          '/batch/%E4%BD%A0%E5%A5%BD?item=1',
+        ]) {
+          const failed = await request('GET', path);
+          expect(failed.status).toBe(400);
+          expect(failed.body.message).toBe('ID');
+        }
+      });
+
+      it('recognises deny in any percent-encoded form exactly like plaintext', async () => {
+        for (const path of [
+          '/batch/7?item=%64%65%6e%79',
+          '/batch/7?item=den%79',
+          '/batch/7?item=%64%65ny',
+          '/batch/7?item=%64%65%6E%79',
+        ]) {
+          const denied = await request('GET', path);
+          expect(denied.status).toBe(409);
+          expect(denied.body).toEqual({
+            statusCode: 409,
+            error: 'Conflict',
+            message: 'DENIED',
+          });
+        }
+      });
+
+      it('does not treat double-encoded or differently-cased deny as a conflict', async () => {
+        const doubleEncoded = await request(
+          'GET',
+          '/batch/7?item=%2564%65%6e%79',
+        );
+        expect(doubleEncoded.status).toBe(400);
+        expect(doubleEncoded.body.message).toEqual(['ITEM[0]']);
+
+        for (const path of ['/batch/7?item=DENY', '/batch/7?item=DeNy']) {
+          const failed = await request('GET', path);
+          expect(failed.status).toBe(400);
+          expect(failed.body.message).toEqual(['ITEM[0]']);
+        }
+      });
+
+      it('lets an encoded deny win immediately, discarding staged indexed errors and skipping later values', async () => {
+        const denied = await request(
+          'GET',
+          '/batch/7?item=x&item=%64%65%6e%79&item=%zz',
+        );
+        expect(denied.status).toBe(409);
+        expect(denied.body.message).toBe('DENIED');
+        expect(isolationState.handlerCalls.batch ?? 0).toBe(0);
+        // Two elements were inspected (first staged, deny aborted); the
+        // trailing malformed element was never parsed.
+        expect(isolationState.pipeCalls).toEqual(['ID', 'ITEM', 'ITEM']);
+      });
+
+      it('makes the invalid-id 400 win over an encoded deny without inspecting items', async () => {
+        const failed = await request('GET', '/batch/%zz?item=%64%65%6e%79');
+        expect(failed.status).toBe(400);
+        expect(failed.body.message).toBe('ID');
+        expect(isolationState.pipeCalls.filter(t => t === 'ITEM')).toHaveLength(
+          0,
+        );
+      });
+    });
+
     describe('unannotated batch compatibility route', () => {
       it('still serves a valid batch with the array shape', async () => {
         const ok = await request('GET', '/batch-plain/7?item=2&item=4');

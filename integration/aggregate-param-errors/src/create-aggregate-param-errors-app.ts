@@ -5,6 +5,10 @@ import {
 } from '@nestjs/platform-fastify';
 import { Test } from '@nestjs/testing';
 import request from 'supertest';
+import {
+  batchIdDecodingGuard,
+  batchIdFrameworkErrors,
+} from './batch-id-decoding.js';
 import { AggregateParamErrorsModule } from './aggregate-param-errors.module.js';
 
 export type AggregateParamErrorsAdapter = 'express' | 'fastify';
@@ -53,7 +57,13 @@ export async function createAggregateParamErrorsApp(
 
   if (adapter === 'fastify') {
     const app = moduleRef.createNestApplication<NestFastifyApplication>(
-      new FastifyAdapter(),
+      new FastifyAdapter({
+        // Normalise a framework-level bad-URL rejection (malformed percent
+        // sequence in the batch id segment) to the same plain 'ID' 400 the
+        // Express adapter yields. Without this hook Fastify answers before
+        // the request ever reaches Nest.
+        frameworkErrors: batchIdFrameworkErrors,
+      }),
     );
     await app.init();
     await app.getHttpAdapter().getInstance().ready();
@@ -88,6 +98,11 @@ export async function createAggregateParamErrorsApp(
   }
 
   const app = moduleRef.createNestApplication();
+  // Mounted ahead of the routes (and Nest's exception layer): Express lazily
+  // decodes path params while matching, so an undecodable batch id segment
+  // would otherwise produce Express's own "Failed to decode param" 400 that
+  // does not exist on Fastify. Answer with the canonical plain 'ID' 400.
+  app.use(batchIdDecodingGuard);
   // Listen on an ephemeral port up front: supertest reuses an already
   // listening server instead of racing listen()/close() per request, which
   // keeps genuinely parallel requests on the same instance reliable.
