@@ -581,7 +581,10 @@ describe('Graceful Shutdown (Fastify)', () => {
       const { port } = await createApp();
 
       const started = Date.now();
-      const response = await request(port, '/graceful-probe?mode=slow&delay=100');
+      const response = await request(
+        port,
+        '/graceful-probe?mode=slow&delay=100',
+      );
       expect(Date.now() - started).toBeGreaterThanOrEqual(80);
       expect(response.status).toBe(200);
       expect(response.body).toBe('ok');
@@ -673,7 +676,9 @@ describe('Graceful Shutdown (Fastify)', () => {
       expect(appCounters.cleanupCount).toBe(1);
 
       // The instance cannot receive requests anymore
-      await expect(request(port, '/graceful-probe?mode=stats')).rejects.toThrow();
+      await expect(
+        request(port, '/graceful-probe?mode=stats'),
+      ).rejects.toThrow();
     }, 10000);
 
     it('rejects a partial-body probe after shutdown without polluting counters', async () => {
